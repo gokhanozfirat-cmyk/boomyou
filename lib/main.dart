@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'core/router.dart';
 import 'core/theme.dart';
 import 'services/auth_service.dart';
+import 'services/notification_service.dart';
 import 'services/vault_service.dart';
 
 Future<void> main() async {
@@ -18,6 +20,9 @@ Future<void> main() async {
 
   // Load environment variables
   await dotenv.load(fileName: '.env');
+
+  // Initialize Firebase for FCM
+  await Firebase.initializeApp();
 
   // Initialize Supabase
   await Supabase.initialize(
@@ -35,6 +40,9 @@ Future<void> main() async {
   // Initialize default vault for the user
   final vaultService = VaultService();
   await vaultService.initDefaultVault();
+
+  // Initialize push notifications (FCM token + permission sync)
+  await NotificationService().initialize();
 
   runApp(const BoomYouApp());
 }

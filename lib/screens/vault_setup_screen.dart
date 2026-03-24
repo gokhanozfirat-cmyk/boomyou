@@ -91,7 +91,13 @@ class _VaultSetupScreenState extends State<VaultSetupScreen> {
         backgroundColor: kBackground,
         leading: IconButton(
           icon: const Icon(Icons.arrow_back, color: kTextPrimary),
-          onPressed: () => context.go('/game'),
+          onPressed: () {
+            if (context.canPop()) {
+              context.pop();
+            } else {
+              context.go('/game');
+            }
+          },
         ),
         title: Text(
           'Alan Kurulumu',
