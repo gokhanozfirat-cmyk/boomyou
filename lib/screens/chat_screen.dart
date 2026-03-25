@@ -50,6 +50,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _isSending = false;
   bool _leavingForBackground = false;
   bool _exitToGameOnResume = false;
+  bool _isExternalPickerActive = false;
   Timer? _idleExitTimer;
   Timer? _readMarkDebounce;
 
@@ -79,6 +80,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (!mounted) return;
 
+    // Native pickers (image/file) temporarily pause the app; do not force game lock then.
+    if (_isExternalPickerActive) {
+      if (state == AppLifecycleState.resumed) {
+        _restartIdleTimer();
+      }
+      return;
+    }
+
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.hidden ||
         state == AppLifecycleState.paused ||
@@ -95,6 +104,19 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
     if (state == AppLifecycleState.resumed) {
       _restartIdleTimer();
+    }
+  }
+
+  Future<T?> _runWithExternalPicker<T>(Future<T?> Function() action) async {
+    _isExternalPickerActive = true;
+    _cancelIdleTimer();
+    try {
+      return await action();
+    } finally {
+      _isExternalPickerActive = false;
+      if (mounted && !_leavingForBackground) {
+        _restartIdleTimer();
+      }
     }
   }
 
@@ -448,9 +470,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   Future<void> _pickAndSendImage({required bool oneTime}) async {
     try {
-      final picked = await _imagePicker.pickImage(
-        source: ImageSource.gallery,
-        imageQuality: 85,
+      _messageFocus.unfocus();
+      final picked = await _runWithExternalPicker(
+        () => _imagePicker.pickImage(
+          source: ImageSource.gallery,
+          imageQuality: 85,
+        ),
       );
       if (picked == null) return;
       final bytes = await picked.readAsBytes();
@@ -461,14 +486,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         type: _MessagePayload.typeImage,
         oneTime: oneTime,
       );
-    } catch (_) {
+    } catch (e) {
+      debugPrint('Image picker/send failed: $e');
       _showSnack('Görsel seçilemedi.');
     }
   }
 
   Future<void> _pickAndSendFile() async {
     try {
-      final result = await FilePicker.platform.pickFiles(withData: true);
+      _messageFocus.unfocus();
+      final result = await _runWithExternalPicker(
+        () => FilePicker.platform.pickFiles(withData: true),
+      );
       if (result == null || result.files.isEmpty) return;
       final file = result.files.first;
       final bytes = file.bytes;
@@ -492,7 +521,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         mimeType: mime,
         type: _MessagePayload.typeFile,
       );
-    } catch (_) {
+    } catch (e) {
+      debugPrint('File picker/send failed: $e');
       _showSnack('Dosya gönderilemedi.');
     }
   }
