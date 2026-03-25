@@ -44,6 +44,7 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 .env
+supabase/.temp/
 google-services.json
 GoogleService-Info.plist
 *.jks
