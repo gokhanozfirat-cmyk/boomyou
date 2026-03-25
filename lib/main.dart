@@ -35,14 +35,20 @@ Future<void> main() async {
 
   // Ensure anonymous auth
   final authService = AuthService();
-  await authService.ensureAnonymousAuth();
+  try {
+    await authService.ensureAnonymousAuth();
+  } catch (_) {}
 
   // Initialize default vault for the user
   final vaultService = VaultService();
-  await vaultService.initDefaultVault();
+  try {
+    await vaultService.initDefaultVault();
+  } catch (_) {}
 
   // Initialize push notifications (FCM token + permission sync)
-  await NotificationService().initialize();
+  try {
+    await NotificationService().initialize();
+  } catch (_) {}
 
   runApp(const BoomYouApp());
 }

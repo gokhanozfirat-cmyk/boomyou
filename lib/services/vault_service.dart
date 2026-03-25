@@ -340,13 +340,25 @@ class VaultService {
   }
 
   Future<List<Map<String, dynamic>>> getConversations(String vaultId) async {
-    final result = await supabase
-        .from('conversations')
-        .select('*')
-        .or('initiator_vault_id.eq.$vaultId,participant_vault_id.eq.$vaultId')
-        .order('created_at', ascending: false);
+    try {
+      final result = await supabase
+          .from('conversations')
+          .select('*')
+          .or('initiator_vault_id.eq.$vaultId,participant_vault_id.eq.$vaultId')
+          .eq('is_closed', false)
+          .order('created_at', ascending: false);
 
-    return List<Map<String, dynamic>>.from(result as List);
+      return List<Map<String, dynamic>>.from(result as List);
+    } catch (_) {
+      // Backward compatibility: older schema may not have is_closed.
+      final result = await supabase
+          .from('conversations')
+          .select('*')
+          .or('initiator_vault_id.eq.$vaultId,participant_vault_id.eq.$vaultId')
+          .order('created_at', ascending: false);
+
+      return List<Map<String, dynamic>>.from(result as List);
+    }
   }
 
   Future<Map<String, int>> getUnreadCounts(
@@ -572,6 +584,40 @@ class VaultService {
     final resolvedFromUserId = invite?['from_user_id'] as String? ?? fromUserId;
     final fromVaultId = invite?['from_vault_id'] as String?;
 
+    // Ensure a fresh thread on re-invite: close any existing active
+    // conversations between these two users (and same vault pair when present).
+    try {
+      final existing = await supabase
+          .from('conversations')
+          .select('id, is_closed, initiator_vault_id, participant_vault_id')
+          .or('and(initiator_id.eq.$resolvedFromUserId,participant_id.eq.$userId),and(initiator_id.eq.$userId,participant_id.eq.$resolvedFromUserId)');
+
+      final now = DateTime.now().toUtc().toIso8601String();
+      for (final row in List<Map<String, dynamic>>.from(existing as List)) {
+        if (row['is_closed'] == true) continue;
+
+        if (fromVaultId != null) {
+          final existingInitiatorVault = row['initiator_vault_id'] as String?;
+          final existingParticipantVault =
+              row['participant_vault_id'] as String?;
+          final sameVaultPair = (existingInitiatorVault == fromVaultId &&
+                  existingParticipantVault == vaultId) ||
+              (existingInitiatorVault == vaultId &&
+                  existingParticipantVault == fromVaultId);
+          if (!sameVaultPair) continue;
+        }
+
+        await supabase.from('conversations').update({
+          'is_closed': true,
+          'closed_at': now,
+          'closed_by_vault_id': vaultId,
+        }).eq('id', row['id']);
+      }
+    } catch (_) {
+      // Backward compatibility: keep invite flow working even if close columns
+      // are not available yet in an old schema.
+    }
+
     // Create conversation
     final conv = await supabase
         .from('conversations')
@@ -645,6 +691,12 @@ class VaultService {
       // Backward compatibility: older schema may not have is_closed.
       return false;
     }
+  }
+
+  Future<void> deleteConversation(String conversationId, String vaultId) async {
+    // Product behavior: "delete conversation" closes it for both parties.
+    // It disappears from list and requires a new invite to chat again.
+    await closeConversation(conversationId, vaultId);
   }
 
   Future<void> closeConversation(String conversationId, String vaultId) async {

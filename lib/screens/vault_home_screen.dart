@@ -274,6 +274,62 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
     );
   }
 
+  Future<void> _confirmDeleteConversation(String conversationId) async {
+    final shouldDelete = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: kBombBody,
+        title: Text(
+          'Sohbeti Sil',
+          style: GoogleFonts.orbitron(color: kAccentRed),
+        ),
+        content: Text(
+          'Bu sohbet kapatılır ve listeden kaldırılır. Tekrar konuşmak için yeni davet gerekir. Devam edilsin mi?',
+          style: GoogleFonts.orbitron(color: kTextSecondary, fontSize: 12),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text(
+              'Vazgeç',
+              style: GoogleFonts.orbitron(color: kTextSecondary),
+            ),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: kAccentRed),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text(
+              'Sil',
+              style: GoogleFonts.orbitron(color: kTextPrimary),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    if (shouldDelete == true) {
+      try {
+        await _vaultService.deleteConversation(conversationId, widget.vaultId);
+        if (mounted) {
+          setState(() => _conversations
+              .removeWhere((c) => c['id'].toString() == conversationId));
+        }
+      } catch (_) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                'Sohbet kapatılamadı.',
+                style: GoogleFonts.orbitron(color: kTextPrimary, fontSize: 12),
+              ),
+              backgroundColor: kBombBody,
+            ),
+          );
+        }
+      }
+    }
+  }
+
   Future<void> _sendInvite(String toRumus) async {
     final normalizedTarget = toRumus.trim().toLowerCase();
     if (normalizedTarget.isEmpty) return;
@@ -911,6 +967,8 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
                   onTap: () => context.push(
                     '/chat/${conv['id']}?vaultId=${Uri.encodeComponent(widget.vaultId)}',
                   ),
+                  onLongPress: () =>
+                      _confirmDeleteConversation(conv['id'].toString()),
                 )),
         ],
       ),
@@ -1041,6 +1099,7 @@ class _ConversationTile extends StatefulWidget {
   final int unreadCount;
   final VaultService vaultService;
   final VoidCallback onTap;
+  final VoidCallback? onLongPress;
 
   const _ConversationTile({
     required this.conversation,
@@ -1048,6 +1107,7 @@ class _ConversationTile extends StatefulWidget {
     required this.unreadCount,
     required this.vaultService,
     required this.onTap,
+    this.onLongPress,
   });
 
   @override
@@ -1163,6 +1223,7 @@ class _ConversationTileState extends State<_ConversationTile> {
         ],
       ),
       onTap: widget.onTap,
+      onLongPress: widget.onLongPress,
     );
   }
 }

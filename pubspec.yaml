@@ -1,7 +1,7 @@
 name: boomyou
 description: "Boomyou"
 publish_to: 'none'
-version: 1.0.1+2
+version: 1.0.2+3
 environment:
   sdk: ^3.5.0
 dependencies:
@@ -18,6 +18,9 @@ dependencies:
   firebase_core: ^3.15.2
   firebase_messaging: ^15.2.10
   flutter_local_notifications: ^17.2.4
+dependency_overrides:
+  storage_client: 2.4.1
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

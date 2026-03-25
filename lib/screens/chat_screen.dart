@@ -53,11 +53,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _isExternalPickerActive = false;
   Timer? _idleExitTimer;
   Timer? _readMarkDebounce;
+  Timer? _autoExpireTimer;
+  bool _timerEnabled = false;
 
   static const Duration _idleTimeout = Duration(seconds: 10);
+  static const Duration _expireDuration = Duration(hours: 1);
 
   String get _hiddenStoreKey =>
       'chat_hidden_${_myUserId ?? "anon"}_${widget.conversationId}';
+  String get _timerEnabledKey => 'chat_timer_enabled_${widget.conversationId}';
+  String get _timerReadAtKey => 'chat_timer_read_at_${widget.conversationId}';
 
   bool get _selectionMode => _selectedMessageIds.isNotEmpty;
 
@@ -72,8 +77,40 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _messageController.addListener(_onUserActivity);
     _restartIdleTimer();
     _loadHiddenMessages();
+    _loadTimerState();
     _loadInitialData();
     _subscribeToMessages();
+  }
+
+  @override
+  void didUpdateWidget(covariant ChatScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.conversationId == widget.conversationId) return;
+
+    _subscription?.unsubscribe();
+    _subscription = null;
+    _readMarkDebounce?.cancel();
+    _autoExpireTimer?.cancel();
+    _messageController.clear();
+
+    if (!mounted) return;
+    setState(() {
+      _messages = [];
+      _hiddenMessageIds.clear();
+      _selectedMessageIds.clear();
+      _otherRumus = null;
+      _myVaultId = null;
+      _isConversationClosed = false;
+      _isLoading = true;
+      _isSending = false;
+      _timerEnabled = false;
+    });
+
+    _loadHiddenMessages();
+    _loadTimerState();
+    _loadInitialData();
+    _subscribeToMessages();
+    _restartIdleTimer();
   }
 
   @override
@@ -183,6 +220,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       widget.conversationId,
       resolvedVaultId,
     );
+
+    if (_timerEnabled) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString(
+          _timerReadAtKey, DateTime.now().toUtc().toIso8601String());
+    }
   }
 
   @override
@@ -192,11 +235,73 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _messageController.removeListener(_onUserActivity);
     _cancelIdleTimer();
     _readMarkDebounce?.cancel();
+    _autoExpireTimer?.cancel();
     _subscription?.unsubscribe();
     _messageController.dispose();
     _scrollController.dispose();
     _messageFocus.dispose();
     super.dispose();
+  }
+
+  Future<void> _loadTimerState() async {
+    final prefs = await SharedPreferences.getInstance();
+    final enabled = prefs.getBool(_timerEnabledKey) ?? false;
+    if (!mounted) return;
+    setState(() => _timerEnabled = enabled);
+    if (enabled) _startAutoExpireTimer();
+  }
+
+  Future<void> _toggleTimer() async {
+    final prefs = await SharedPreferences.getInstance();
+    final newValue = !_timerEnabled;
+    await prefs.setBool(_timerEnabledKey, newValue);
+    if (!mounted) return;
+    setState(() => _timerEnabled = newValue);
+    if (newValue) {
+      _startAutoExpireTimer();
+      _showSnack('Zamanlayıcı açık — okunmuş mesajlar 1 saat sonra kaybolur.');
+    } else {
+      _autoExpireTimer?.cancel();
+      _showSnack('Zamanlayıcı kapatıldı.');
+    }
+  }
+
+  void _startAutoExpireTimer() {
+    _autoExpireTimer?.cancel();
+    // Check every minute
+    _autoExpireTimer = Timer.periodic(const Duration(minutes: 1), (_) {
+      _expireReadMessages();
+    });
+    // Also check immediately
+    _expireReadMessages();
+  }
+
+  Future<void> _expireReadMessages() async {
+    if (!_timerEnabled || !mounted) return;
+    final prefs = await SharedPreferences.getInstance();
+    final readAtStr = prefs.getString(_timerReadAtKey);
+    if (readAtStr == null) return;
+    final readAt = DateTime.tryParse(readAtStr);
+    if (readAt == null) return;
+    final expireAt = readAt.add(_expireDuration);
+    if (DateTime.now().isBefore(expireAt)) return;
+
+    // 1 hour has passed since last read — hide all messages created before readAt
+    final toHide = _messages.map((m) => (m['id'] ?? '').toString()).where((id) {
+      if (id.isEmpty || _hiddenMessageIds.contains(id)) return false;
+      final msg = _messages.firstWhere(
+        (m) => (m['id'] ?? '').toString() == id,
+        orElse: () => {},
+      );
+      if (msg.isEmpty) return false;
+      final createdAt = DateTime.tryParse((msg['created_at'] ?? '').toString());
+      if (createdAt == null) return false;
+      return createdAt.isBefore(readAt.add(const Duration(seconds: 1)));
+    }).toList();
+
+    if (toHide.isEmpty) return;
+    setState(() => _hiddenMessageIds.addAll(toHide));
+    await _persistHiddenMessages();
   }
 
   Future<void> _loadHiddenMessages() async {
@@ -546,6 +651,9 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       final objectPath =
           '${_activeUserId ?? "anon"}/${DateTime.now().millisecondsSinceEpoch}_$safeName';
 
+      debugPrint(
+          'UPLOAD: userId=$_activeUserId bytes=${bytes.length} path=$objectPath mime=$mimeType');
+
       await supabase.storage.from('chat_attachments').uploadBinary(
             objectPath,
             bytes,
@@ -574,9 +682,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         payload,
         senderVaultId: senderVaultId,
       );
-    } catch (_) {
-      _showSnack(
-          'Ek gönderilemedi. "chat_attachments" public bucket ve policy kontrol et.');
+    } catch (e, stack) {
+      debugPrint('UPLOAD FULL ERROR: $e\n$stack');
+      String msg = 'Hata: $e';
+      try {
+        final se = e as dynamic;
+        msg = 'Hata: msg=${se.message} status=${se.statusCode} err=${se.error}';
+      } catch (_) {}
+      _showSnack(msg);
     } finally {
       if (mounted) setState(() => _isSending = false);
     }
@@ -593,6 +706,52 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         backgroundColor: kBombBody,
       ),
     );
+  }
+
+  Future<void> _confirmClearMessages() async {
+    if (_selectionMode) return;
+    if (_messages.isEmpty) return;
+
+    final shouldClear = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: kBombBody,
+        title: Text(
+          'Mesajları Temizle',
+          style: GoogleFonts.orbitron(color: kAccentRed),
+        ),
+        content: Text(
+          'Tüm mesajlar senin için gizlenir. Sohbet açık kalır, karşı taraf etkilenmez.',
+          style: GoogleFonts.orbitron(color: kTextSecondary, fontSize: 12),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text(
+              'Vazgeç',
+              style: GoogleFonts.orbitron(color: kTextSecondary),
+            ),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: kAccentRed),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text(
+              'Temizle',
+              style: GoogleFonts.orbitron(color: kTextPrimary),
+            ),
+          ),
+        ],
+      ),
+    );
+
+    if (shouldClear == true) {
+      final allIds = _messages.map((m) => (m['id'] ?? '').toString()).toSet();
+      setState(() {
+        _hiddenMessageIds.addAll(allIds);
+        _selectedMessageIds.clear();
+      });
+      await _persistHiddenMessages();
+    }
   }
 
   Future<void> _confirmCloseConversation() async {
@@ -698,6 +857,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       return;
     }
     if (payload.isImage && payload.url != null) {
+      if (payload.oneTime && isMe) return;
       await _openImage(payload);
       if (payload.oneTime) {
         await _hideMessageLocally(messageId);
@@ -819,15 +979,23 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               onPressed: _hideSelectedMessages,
               icon: const Icon(Icons.delete_outline, color: kAccentRed),
             )
-          else
+          else ...[
             IconButton(
-              tooltip: 'Sohbeti sil (kapat)',
-              onPressed: _confirmCloseConversation,
+              tooltip: _timerEnabled
+                  ? 'Zamanlayıcı açık (kapat)'
+                  : 'Zamanlayıcı kapalı (aç)',
+              onPressed: _toggleTimer,
               icon: Icon(
-                Icons.delete_sweep_outlined,
-                color: _isConversationClosed ? kTextSecondary : kAccentRed,
+                _timerEnabled ? Icons.timer : Icons.timer_off_outlined,
+                color: _timerEnabled ? kAccentGreen : kTextSecondary,
               ),
             ),
+            IconButton(
+              tooltip: 'Mesajları temizle',
+              onPressed: _confirmClearMessages,
+              icon: const Icon(Icons.delete_sweep_outlined, color: kAccentRed),
+            ),
+          ],
         ],
       ),
       body: Listener(
@@ -1100,23 +1268,44 @@ class _MessageBubble extends StatelessWidget {
                 ),
               ),
             if (payload.isImage && payload.url != null) ...[
-              ClipRRect(
-                borderRadius: BorderRadius.circular(10),
-                child: Image.network(
-                  payload.url!,
-                  height: 180,
-                  width: 180,
-                  fit: BoxFit.cover,
+              Container(
+                width: 160,
+                height: 90,
+                decoration: BoxDecoration(
+                  color: kBackground,
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: payload.oneTime
+                        ? kAccentRed.withAlpha(180)
+                        : kBombBorder,
+                  ),
                 ),
-              ),
-              const SizedBox(height: 6),
-              Text(
-                payload.oneTime
-                    ? 'Tek seferlik foto (dokun-aç)'
-                    : 'Foto (dokun-aç)',
-                style: GoogleFonts.orbitron(
-                  color: kTextSecondary,
-                  fontSize: 10,
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(
+                      payload.oneTime
+                          ? Icons.timer_outlined
+                          : Icons.image_outlined,
+                      color: payload.oneTime ? kAccentRed : kTextSecondary,
+                      size: 28,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      payload.oneTime ? 'Tek seferlik foto' : 'Foto',
+                      style: GoogleFonts.orbitron(
+                        color: payload.oneTime ? kAccentRed : kTextSecondary,
+                        fontSize: 10,
+                      ),
+                    ),
+                    Text(
+                      'dokun → aç',
+                      style: GoogleFonts.orbitron(
+                        color: kTextSecondary,
+                        fontSize: 9,
+                      ),
+                    ),
+                  ],
                 ),
               ),
             ],

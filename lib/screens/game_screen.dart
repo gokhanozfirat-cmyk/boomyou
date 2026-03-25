@@ -201,24 +201,44 @@ class _GameScreenState extends State<GameScreen>
     if (input.isEmpty) return;
     _inputController.clear();
 
-    final vaultId = await _vaultService.checkCode(input);
-    if (!mounted) return;
-
-    if (vaultId != null) {
-      _pauseLoop();
-      final isSetup = await _vaultService.isVaultSetup(vaultId);
+    try {
+      final vaultId = await _vaultService.checkCode(input);
       if (!mounted) return;
 
-      if (isSetup) {
-        await context.push('/vault/$vaultId');
-      } else {
-        await context.push('/vault-setup/$vaultId');
-      }
+      if (vaultId != null) {
+        _pauseLoop();
+        bool isSetup = true;
+        try {
+          isSetup = await _vaultService.isVaultSetup(vaultId);
+        } catch (_) {
+          // If setup status lookup fails, still try to open the vault screen.
+          isSetup = true;
+        }
+        if (!mounted) return;
 
-      if (mounted) {
-        _resumeLoop();
-        _inputFocus.requestFocus();
+        if (isSetup) {
+          await context.push('/vault/$vaultId');
+        } else {
+          await context.push('/vault-setup/$vaultId');
+        }
+
+        if (mounted) {
+          _resumeLoop();
+          _inputFocus.requestFocus();
+        }
+        return;
       }
+    } catch (_) {
+      if (!mounted) return;
+      _showFailFlashOnce();
+      _inputFocus.requestFocus();
+      return;
+    }
+
+    // If user entered a 6-digit number, treat it as vault code attempt.
+    if (RegExp(r'^\d{6}$').hasMatch(input)) {
+      _showFailFlashOnce();
+      _inputFocus.requestFocus();
       return;
     }
 
@@ -236,11 +256,15 @@ class _GameScreenState extends State<GameScreen>
       return;
     }
 
+    _showFailFlashOnce();
+    _inputFocus.requestFocus();
+  }
+
+  void _showFailFlashOnce() {
     setState(() => _showFailFlash = true);
     Future.delayed(const Duration(milliseconds: 300), () {
       if (mounted) setState(() => _showFailFlash = false);
     });
-    _inputFocus.requestFocus();
   }
 
   void _restartGame() {
@@ -263,6 +287,8 @@ class _GameScreenState extends State<GameScreen>
     if (_showSuccessFlash) flashColor = kAccentGreen.withAlpha(60);
     if (_showFailFlash) flashColor = kAccentRed.withAlpha(60);
 
+    final keyboardHeight = MediaQuery.of(context).viewInsets.bottom;
+
     return Scaffold(
       backgroundColor: flashColor,
       resizeToAvoidBottomInset: false,
@@ -274,6 +300,7 @@ class _GameScreenState extends State<GameScreen>
                 _buildStatusBar(),
                 Expanded(child: _buildGameArea()),
                 _buildInputBar(),
+                SizedBox(height: keyboardHeight),
               ],
             ),
             if (_gameOver) _buildGameOverOverlay(),

@@ -806,13 +806,13 @@ packages:
     source: hosted
     version: "1.12.1"
   storage_client:
-    dependency: transitive
+    dependency: "direct overridden"
     description:
       name: storage_client
-      sha256: "4ab4b433ddda1b05a6852f451a74a770028c6ad60ea349c0f0082c6f19be69ad"
+      sha256: "1c61b19ed9e78f37fdd1ca8b729ab8484e6c8fe82e15c87e070b861951183657"
       url: "https://pub.dev"
     source: hosted
-    version: "2.5.0"
+    version: "2.4.1"
   stream_channel:
     dependency: transitive
     description:

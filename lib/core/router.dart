@@ -1,9 +1,11 @@
+import 'package:flutter/foundation.dart';
 import 'package:go_router/go_router.dart';
 import 'navigation_observer.dart';
 import '../screens/game_screen.dart';
 import '../screens/vault_setup_screen.dart';
 import '../screens/vault_home_screen.dart';
 import '../screens/chat_screen.dart';
+import '../screens/attachment_gallery_screen.dart';
 
 final appRouter = GoRouter(
   initialLocation: '/game',
@@ -27,10 +29,19 @@ final appRouter = GoRouter(
     ),
     GoRoute(
       path: '/chat/:conversationId',
-      builder: (context, state) => ChatScreen(
-        conversationId: state.pathParameters['conversationId']!,
-        activeVaultId: state.uri.queryParameters['vaultId'],
-      ),
+      builder: (context, state) {
+        final conversationId = state.pathParameters['conversationId']!;
+        final activeVaultId = state.uri.queryParameters['vaultId'];
+        return ChatScreen(
+          key: ValueKey('chat:$conversationId:${activeVaultId ?? ""}'),
+          conversationId: conversationId,
+          activeVaultId: activeVaultId,
+        );
+      },
+    ),
+    GoRoute(
+      path: '/gallery',
+      builder: (context, state) => const AttachmentGalleryScreen(),
     ),
   ],
 );
