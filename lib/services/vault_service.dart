@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:crypto/crypto.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import '../core/supabase_client.dart';
 import 'auth_service.dart';
 
@@ -250,12 +251,18 @@ class VaultService {
       }
 
       return response.toString();
-    } catch (_) {
+    } on PostgrestException catch (e) {
+      // Only fall back to direct query when the RPC function doesn't exist yet
+      // (SQLSTATE 42883 = undefined_function). All other errors (wrong credentials
+      // etc.) must propagate so the caller shows the correct message.
+      if (e.code != '42883') {
+        throw Exception("Rumus veya şifre yanlış.");
+      }
+
       // Backward compatibility fallback when RPC does not exist yet.
       final ownVault = await supabase
           .from("vaults")
           .select("id")
-          .eq("user_id", userId)
           .eq("rumus", normalizedRumus)
           .eq("code_hash", codeHash)
           .maybeSingle();
@@ -281,10 +288,13 @@ class VaultService {
         return vaultRumus;
       }
     } catch (_) {
-      // Backward compatibility: older schema may not have vault rumus.
+      // Could not retrieve vault rumus — return null so callers can fall back
+      // properly.  Do NOT return getCurrentUserRumus() here because this
+      // function is also called for OTHER people's vaults, in which case
+      // returning the current user's rumus would display the wrong name.
     }
 
-    return getCurrentUserRumus();
+    return null;
   }
 
   Future<void> changeVaultCode(String vaultId, String newCode) async {
@@ -337,6 +347,21 @@ class VaultService {
         .order('created_at');
 
     return List<Map<String, dynamic>>.from(result as List);
+  }
+
+  Future<bool> isVaultOwnedByCurrentUser(String vaultId) async {
+    final userId = _auth.currentUserId;
+    final normalizedVaultId = vaultId.trim();
+    if (userId == null || normalizedVaultId.isEmpty) return false;
+
+    final result = await supabase
+        .from('vaults')
+        .select('id')
+        .eq('id', normalizedVaultId)
+        .eq('user_id', userId)
+        .maybeSingle();
+
+    return result != null;
   }
 
   Future<List<Map<String, dynamic>>> getConversations(String vaultId) async {
@@ -450,6 +475,52 @@ class VaultService {
       );
     } catch (_) {
       // Backward compatibility: table may not exist yet.
+    }
+  }
+
+  Future<Set<String>> loadHiddenMessageIds(String vaultId) async {
+    try {
+      final result = await supabase
+          .from('message_hidden')
+          .select('message_id')
+          .eq('vault_id', vaultId);
+      return Set<String>.from(
+        (result as List).map((r) => r['message_id'].toString()),
+      );
+    } catch (_) {
+      return <String>{};
+    }
+  }
+
+  Future<void> hideMessagesForVault(
+      String vaultId, Set<String> messageIds) async {
+    if (messageIds.isEmpty) return;
+    try {
+      final rows = messageIds
+          .map((id) => {'message_id': id, 'vault_id': vaultId})
+          .toList();
+      await supabase.from('message_hidden').upsert(
+            rows,
+            onConflict: 'message_id,vault_id',
+          );
+    } catch (_) {
+      // Backward compatibility: table may not exist yet.
+    }
+  }
+
+  Future<DateTime?> getConversationLastReadAt(
+      String conversationId, String vaultId) async {
+    try {
+      final result = await supabase
+          .from('conversation_reads')
+          .select('last_read_at')
+          .eq('conversation_id', conversationId)
+          .eq('vault_id', vaultId)
+          .maybeSingle();
+      if (result == null) return null;
+      return DateTime.tryParse(result['last_read_at'].toString());
+    } catch (_) {
+      return null;
     }
   }
 
@@ -654,6 +725,79 @@ class VaultService {
     return List<Map<String, dynamic>>.from(result as List);
   }
 
+  Future<void> markMessageOpened(String messageId) async {
+    try {
+      await supabase
+          .from('messages')
+          .update({'is_opened': true}).eq('id', messageId);
+    } catch (_) {
+      // Backward compatibility: column may not exist yet.
+    }
+  }
+
+  Future<bool> archiveOneTimeMessage(String messageId) async {
+    final normalizedMessageId = messageId.trim();
+    if (normalizedMessageId.isEmpty) return false;
+
+    bool parseArchiveResult(dynamic result) {
+      if (result == true) return true;
+      if (result is num) return result > 0;
+      if (result is String) {
+        return result.toLowerCase().trim() == 'true';
+      }
+      return false;
+    }
+
+    try {
+      final result = await supabase.rpc(
+        'archive_one_time_message',
+        params: {'input_message_id': normalizedMessageId},
+      );
+      if (parseArchiveResult(result)) return true;
+    } catch (_) {
+      // Retry once after refreshing auth; this helps when session JWT expires.
+      try {
+        await supabase.auth.refreshSession();
+        final retryResult = await supabase.rpc(
+          'archive_one_time_message',
+          params: {'input_message_id': normalizedMessageId},
+        );
+        if (parseArchiveResult(retryResult)) return true;
+      } catch (_) {}
+    }
+
+    // Fallback for older schemas: keep existing opened marker behavior.
+    await markMessageOpened(normalizedMessageId);
+    return false;
+  }
+
+  Future<int> archiveExpiredReadMessages({
+    required String conversationId,
+    String? vaultId,
+    required DateTime readBefore,
+  }) async {
+    final normalizedConversationId = conversationId.trim();
+    final normalizedVaultId = (vaultId ?? '').trim();
+    if (normalizedConversationId.isEmpty) return 0;
+
+    try {
+      final result = await supabase.rpc(
+        'archive_expired_read_messages',
+        params: {
+          'input_conversation_id': normalizedConversationId,
+          'input_vault_id':
+              normalizedVaultId.isEmpty ? null : normalizedVaultId,
+          'input_read_before': readBefore.toUtc().toIso8601String(),
+        },
+      );
+      if (result is num) return result.toInt();
+      if (result is String) return int.tryParse(result) ?? 0;
+    } catch (_) {
+      // Backward compatibility: RPC may not exist yet.
+    }
+    return 0;
+  }
+
   Future<String?> checkMyConversationVault(String conversationId) async {
     final userId = _auth.currentUserId;
     if (userId == null) return null;
@@ -732,53 +876,15 @@ class VaultService {
 
     try {
       await supabase.from('messages').insert(payload);
-      unawaited(
-        _triggerPushNotification(
-          conversationId: conversationId,
-          senderVaultId: resolvedVaultId,
-          messagePreview: content,
-        ),
-      );
     } catch (e) {
       // Backward compatibility: older schema may not have sender_vault_id.
       if (payload.containsKey('sender_vault_id')) {
         final fallbackPayload = Map<String, dynamic>.from(payload)
           ..remove('sender_vault_id');
         await supabase.from('messages').insert(fallbackPayload);
-        unawaited(
-          _triggerPushNotification(
-            conversationId: conversationId,
-            senderVaultId: resolvedVaultId,
-            messagePreview: content,
-          ),
-        );
         return;
       }
       rethrow;
-    }
-  }
-
-  Future<void> _triggerPushNotification({
-    required String conversationId,
-    required String? senderVaultId,
-    required String messagePreview,
-  }) async {
-    final trimmedPreview = messagePreview.trim();
-    final preview = trimmedPreview.length > 160
-        ? '${trimmedPreview.substring(0, 160)}...'
-        : trimmedPreview;
-
-    try {
-      await supabase.functions.invoke(
-        'send-message-push',
-        body: <String, dynamic>{
-          'conversationId': conversationId,
-          'senderVaultId': senderVaultId,
-          'messagePreview': preview,
-        },
-      );
-    } catch (_) {
-      // Push is best-effort and should never block chat send.
     }
   }
 

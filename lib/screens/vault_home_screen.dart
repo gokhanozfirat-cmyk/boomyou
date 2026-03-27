@@ -12,8 +12,13 @@ import '../services/vault_service.dart';
 
 class VaultHomeScreen extends StatefulWidget {
   final String vaultId;
+  final bool existingSession;
 
-  const VaultHomeScreen({super.key, required this.vaultId});
+  const VaultHomeScreen({
+    super.key,
+    required this.vaultId,
+    this.existingSession = false,
+  });
 
   @override
   State<VaultHomeScreen> createState() => _VaultHomeScreenState();
@@ -26,6 +31,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
   List<Map<String, dynamic>> _pendingInvites = [];
   Map<String, int> _unreadCounts = {};
   String? _myRumus;
+  bool _historyLocked = false;
   bool _isLoading = true;
   RealtimeChannel? _realtimeChannel;
   Timer? _realtimeReloadDebounce;
@@ -215,6 +221,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
       );
       final pendingInvites = await pendingInvitesFuture;
       final myRumus = await myRumusFuture;
+      final historyLocked = widget.existingSession;
 
       if (mounted) {
         setState(() {
@@ -222,6 +229,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
           _pendingInvites = pendingInvites;
           _myRumus = myRumus;
           _unreadCounts = unreadCounts;
+          _historyLocked = historyLocked;
           _isLoading = false;
         });
       }
@@ -550,7 +558,7 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
                     await _vaultService.loginToExistingVault(rumus, code);
                 if (!mounted) return;
                 _showSnack('Alanda oturum açıldı.');
-                await context.push('/vault/$vaultId');
+                await context.push('/vault/$vaultId?existingSession=1');
                 if (mounted) _loadData();
               } catch (_) {
                 _showSnack('Rumus veya şifre yanlış.');
@@ -964,9 +972,14 @@ class _VaultHomeScreenState extends State<VaultHomeScreen>
                   unreadCount:
                       _unreadCounts[(conv['id'] ?? '').toString()] ?? 0,
                   vaultService: _vaultService,
-                  onTap: () => context.push(
-                    '/chat/${conv['id']}?vaultId=${Uri.encodeComponent(widget.vaultId)}',
-                  ),
+                  onTap: () {
+                    final conversationId = (conv['id'] ?? '').toString();
+                    if (conversationId.isEmpty) return;
+                    final query =
+                        '?vaultId=${Uri.encodeComponent(widget.vaultId)}'
+                        '${_historyLocked ? '&historyLocked=1' : ''}';
+                    context.push('/chat/$conversationId$query');
+                  },
                   onLongPress: () =>
                       _confirmDeleteConversation(conv['id'].toString()),
                 )),

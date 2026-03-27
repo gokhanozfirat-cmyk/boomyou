@@ -83,6 +83,77 @@ class _VaultSetupScreenState extends State<VaultSetupScreen> {
     }
   }
 
+  void _showLoginDialog() {
+    final rumusCtrl = TextEditingController();
+    final codeCtrl = TextEditingController();
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: kBombBody,
+        title: Text(
+          'Var Olan Oturumu Aç',
+          style: GoogleFonts.orbitron(color: kTextPrimary),
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: rumusCtrl,
+              style: GoogleFonts.orbitron(color: kTextPrimary),
+              decoration: const InputDecoration(hintText: 'Rumus'),
+              textInputAction: TextInputAction.next,
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: codeCtrl,
+              obscureText: true,
+              keyboardType: TextInputType.number,
+              inputFormatters: [
+                FilteringTextInputFormatter.digitsOnly,
+                LengthLimitingTextInputFormatter(6),
+              ],
+              style: GoogleFonts.orbitron(
+                color: kTextPrimary,
+                letterSpacing: 8,
+              ),
+              decoration: const InputDecoration(hintText: 'Şifre (6 hane)'),
+              textInputAction: TextInputAction.done,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: Text('İptal',
+                style: GoogleFonts.orbitron(color: kTextSecondary)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: kAccentGreen),
+            onPressed: () async {
+              final rumus = rumusCtrl.text.trim().toLowerCase();
+              final code = codeCtrl.text.trim();
+              if (rumus.isEmpty || code.length != 6) return;
+              if (!ctx.mounted) return;
+              Navigator.pop(ctx);
+              try {
+                final vaultId =
+                    await _vaultService.loginToExistingVault(rumus, code);
+                if (!mounted) return;
+                context.replace('/vault/$vaultId?existingSession=1');
+              } catch (_) {
+                if (!mounted) return;
+                setState(() => _errorMessage = 'Rumus veya şifre yanlış.');
+              }
+            },
+            child: Text('Oturum Aç',
+                style: GoogleFonts.orbitron(color: kTextPrimary)),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -217,6 +288,20 @@ class _VaultSetupScreenState extends State<VaultSetupScreen> {
                             fontWeight: FontWeight.bold,
                           ),
                         ),
+                ),
+              ),
+              const SizedBox(height: 16),
+              Center(
+                child: TextButton(
+                  onPressed: _isLoading ? null : _showLoginDialog,
+                  child: Text(
+                    'Var olan oturumu aç',
+                    style: GoogleFonts.orbitron(
+                      color: kAccentGreen,
+                      fontSize: 13,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
                 ),
               ),
             ],

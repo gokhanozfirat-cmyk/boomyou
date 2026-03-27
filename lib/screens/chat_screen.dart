@@ -18,11 +18,13 @@ import '../services/vault_service.dart';
 class ChatScreen extends StatefulWidget {
   final String conversationId;
   final String? activeVaultId;
+  final bool historyLocked;
 
   const ChatScreen({
     super.key,
     required this.conversationId,
     this.activeVaultId,
+    this.historyLocked = false,
   });
 
   @override
@@ -40,6 +42,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   List<Map<String, dynamic>> _messages = [];
   final Set<String> _hiddenMessageIds = {};
   final Set<String> _selectedMessageIds = {};
+  final Set<String> _locallyConsumedOneTimeIds = {};
 
   String? _myUserId;
   String? _otherRumus;
@@ -54,15 +57,15 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Timer? _idleExitTimer;
   Timer? _readMarkDebounce;
   Timer? _autoExpireTimer;
-  bool _timerEnabled = false;
+  bool _isExpiringMessages = false;
 
   static const Duration _idleTimeout = Duration(seconds: 10);
   static const Duration _expireDuration = Duration(hours: 1);
 
   String get _hiddenStoreKey =>
       'chat_hidden_${_myUserId ?? "anon"}_${widget.conversationId}';
-  String get _timerEnabledKey => 'chat_timer_enabled_${widget.conversationId}';
-  String get _timerReadAtKey => 'chat_timer_read_at_${widget.conversationId}';
+  String get _oneTimeConsumedStoreKey =>
+      'chat_one_time_consumed_${_myUserId ?? "anon"}_${widget.conversationId}';
 
   bool get _selectionMode => _selectedMessageIds.isNotEmpty;
 
@@ -76,10 +79,8 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _myUserId = _authService.currentUserId;
     _messageController.addListener(_onUserActivity);
     _restartIdleTimer();
-    _loadHiddenMessages();
-    _loadTimerState();
+    _startAutoExpireTimer();
     _loadInitialData();
-    _subscribeToMessages();
   }
 
   @override
@@ -103,13 +104,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       _isConversationClosed = false;
       _isLoading = true;
       _isSending = false;
-      _timerEnabled = false;
     });
 
     _loadHiddenMessages();
-    _loadTimerState();
+    _startAutoExpireTimer();
     _loadInitialData();
-    _subscribeToMessages();
     _restartIdleTimer();
   }
 
@@ -221,11 +220,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       resolvedVaultId,
     );
 
-    if (_timerEnabled) {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(
-          _timerReadAtKey, DateTime.now().toUtc().toIso8601String());
-    }
+    // last_read_at is already persisted in conversation_reads by markConversationRead above.
   }
 
   @override
@@ -243,29 +238,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     super.dispose();
   }
 
-  Future<void> _loadTimerState() async {
-    final prefs = await SharedPreferences.getInstance();
-    final enabled = prefs.getBool(_timerEnabledKey) ?? false;
-    if (!mounted) return;
-    setState(() => _timerEnabled = enabled);
-    if (enabled) _startAutoExpireTimer();
-  }
-
-  Future<void> _toggleTimer() async {
-    final prefs = await SharedPreferences.getInstance();
-    final newValue = !_timerEnabled;
-    await prefs.setBool(_timerEnabledKey, newValue);
-    if (!mounted) return;
-    setState(() => _timerEnabled = newValue);
-    if (newValue) {
-      _startAutoExpireTimer();
-      _showSnack('Zamanlayıcı açık — okunmuş mesajlar 1 saat sonra kaybolur.');
-    } else {
-      _autoExpireTimer?.cancel();
-      _showSnack('Zamanlayıcı kapatıldı.');
-    }
-  }
-
   void _startAutoExpireTimer() {
     _autoExpireTimer?.cancel();
     // Check every minute
@@ -276,54 +248,128 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _expireReadMessages();
   }
 
-  Future<void> _expireReadMessages() async {
-    if (!_timerEnabled || !mounted) return;
-    final prefs = await SharedPreferences.getInstance();
-    final readAtStr = prefs.getString(_timerReadAtKey);
-    if (readAtStr == null) return;
-    final readAt = DateTime.tryParse(readAtStr);
-    if (readAt == null) return;
-    final expireAt = readAt.add(_expireDuration);
-    if (DateTime.now().isBefore(expireAt)) return;
-
-    // 1 hour has passed since last read — hide all messages created before readAt
-    final toHide = _messages.map((m) => (m['id'] ?? '').toString()).where((id) {
-      if (id.isEmpty || _hiddenMessageIds.contains(id)) return false;
-      final msg = _messages.firstWhere(
-        (m) => (m['id'] ?? '').toString() == id,
-        orElse: () => {},
-      );
-      if (msg.isEmpty) return false;
-      final createdAt = DateTime.tryParse((msg['created_at'] ?? '').toString());
-      if (createdAt == null) return false;
-      return createdAt.isBefore(readAt.add(const Duration(seconds: 1)));
-    }).toList();
-
+  void _autoHideOpenedOneTimeMessages() {
+    const prefix = _MessagePayload.prefix;
+    final toHide = <String>[];
+    for (final msg in _messages) {
+      final id = (msg['id'] ?? '').toString();
+      if (id.isEmpty || _hiddenMessageIds.contains(id)) continue;
+      if (msg['is_opened'] != true) continue;
+      final content = (msg['content'] ?? '').toString();
+      if (!content.startsWith(prefix)) continue;
+      try {
+        final payload = _MessagePayload.decode(content);
+        if (payload.oneTime) toHide.add(id);
+      } catch (_) {}
+    }
     if (toHide.isEmpty) return;
     setState(() => _hiddenMessageIds.addAll(toHide));
-    await _persistHiddenMessages();
+  }
+
+  Future<void> _expireReadMessages() async {
+    if (!mounted || _isExpiringMessages) return;
+    _isExpiringMessages = true;
+
+    try {
+      final currentVaultId = (_myVaultId ?? widget.activeVaultId ?? '').trim();
+      final resolvedVaultId = currentVaultId.isNotEmpty
+          ? currentVaultId
+          : await _vaultService.checkMyConversationVault(widget.conversationId);
+      if (resolvedVaultId != null && resolvedVaultId.isNotEmpty) {
+        _myVaultId ??= resolvedVaultId;
+      }
+
+      DateTime? readAt;
+      if (resolvedVaultId != null && resolvedVaultId.isNotEmpty) {
+        readAt = await _vaultService.getConversationLastReadAt(
+          widget.conversationId,
+          resolvedVaultId,
+        );
+      }
+      readAt ??= DateTime.now().toUtc();
+
+      // Archive only messages that are both:
+      // 1) already read in this vault, and
+      // 2) older than one hour from now.
+      final nowUtc = DateTime.now().toUtc();
+      final oneHourAgo = nowUtc.subtract(_expireDuration);
+      final archiveBefore = readAt.isBefore(oneHourAgo) ? readAt : oneHourAgo;
+
+      final archivedCount = await _vaultService.archiveExpiredReadMessages(
+        conversationId: widget.conversationId,
+        vaultId: resolvedVaultId,
+        readBefore: archiveBefore,
+      );
+      if (!mounted || archivedCount <= 0) return;
+
+      final cutoff = archiveBefore.add(const Duration(seconds: 1));
+      final removedIds = <String>{};
+
+      setState(() {
+        _messages = _messages.where((msg) {
+          final createdAt =
+              DateTime.tryParse((msg['created_at'] ?? '').toString());
+          if (createdAt == null || createdAt.isAfter(cutoff)) return true;
+          final messageId = (msg['id'] ?? '').toString();
+          if (messageId.isNotEmpty) removedIds.add(messageId);
+          return false;
+        }).toList();
+        _hiddenMessageIds.removeAll(removedIds);
+        _selectedMessageIds.removeAll(removedIds);
+      });
+    } finally {
+      _isExpiringMessages = false;
+    }
   }
 
   Future<void> _loadHiddenMessages() async {
-    final prefs = await SharedPreferences.getInstance();
-    final hidden = prefs.getStringList(_hiddenStoreKey) ?? const <String>[];
+    final vaultId = (widget.activeVaultId ?? _myVaultId ?? '').trim();
+    if (vaultId.isEmpty) return;
+    final ids = await _vaultService.loadHiddenMessageIds(vaultId);
     if (!mounted) return;
     setState(() {
       _hiddenMessageIds
         ..clear()
-        ..addAll(hidden);
+        ..addAll(ids);
     });
   }
 
-  Future<void> _persistHiddenMessages() async {
+  Future<void> _loadLocallyConsumedOneTimeMessages() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList(_hiddenStoreKey, _hiddenMessageIds.toList());
+    final ids =
+        prefs.getStringList(_oneTimeConsumedStoreKey) ?? const <String>[];
+    _locallyConsumedOneTimeIds
+      ..clear()
+      ..addAll(ids.where((id) => id.trim().isNotEmpty).map((id) => id.trim()));
+  }
+
+  Future<void> _persistLocallyConsumedOneTimeMessages() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(
+      _oneTimeConsumedStoreKey,
+      _locallyConsumedOneTimeIds.toList(),
+    );
+  }
+
+  Future<void> _consumeOneTimeLocally(String messageId) async {
+    final normalized = messageId.trim();
+    if (normalized.isEmpty) return;
+    if (_locallyConsumedOneTimeIds.add(normalized)) {
+      await _persistLocallyConsumedOneTimeMessages();
+    }
+  }
+
+  Future<void> _persistHiddenMessages() async {
+    final vaultId = (_myVaultId ?? widget.activeVaultId ?? '').trim();
+    if (vaultId.isEmpty || _hiddenMessageIds.isEmpty) return;
+    await _vaultService.hideMessagesForVault(
+        vaultId, Set.from(_hiddenMessageIds));
   }
 
   Future<void> _loadInitialData() async {
     try {
       _myUserId = _activeUserId;
-      final msgs = await _vaultService.getMessages(widget.conversationId);
+      await _loadLocallyConsumedOneTimeMessages();
       Map<String, dynamic>? convResult;
       try {
         convResult = await supabase
@@ -396,6 +442,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         }
       }
 
+      final historyLocked = widget.historyLocked;
+      List<Map<String, dynamic>> msgs = <Map<String, dynamic>>[];
+      if (!historyLocked) {
+        msgs = await _vaultService.getMessages(widget.conversationId);
+        msgs = msgs
+            .where((m) => !_locallyConsumedOneTimeIds
+                .contains((m['id'] ?? '').toString().trim()))
+            .toList();
+      }
+
       if (mounted) {
         msgs.sort(_compareMessageOrder);
         setState(() {
@@ -405,8 +461,17 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           _isConversationClosed = isClosed;
           _isLoading = false;
         });
+        _subscribeToMessages();
         _scrollToBottom();
-        _scheduleMarkConversationRead();
+        await _markConversationReadNow();
+        await _loadHiddenMessages();
+        if (!historyLocked) {
+          _autoHideOpenedOneTimeMessages();
+          unawaited(_expireReadMessages());
+          for (final consumedId in _locallyConsumedOneTimeIds) {
+            unawaited(_vaultService.archiveOneTimeMessage(consumedId));
+          }
+        }
       }
     } catch (_) {
       if (mounted) setState(() => _isLoading = false);
@@ -414,6 +479,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   void _subscribeToMessages() {
+    if (_subscription != null) return;
     _subscription = supabase
         .channel('messages:${widget.conversationId}')
         .onPostgresChanges(
@@ -431,7 +497,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               setState(() {
                 final exists =
                     _messages.any((m) => m['id'] == newMessage['id']);
-                if (!exists) {
+                final messageId = (newMessage['id'] ?? '').toString().trim();
+                if (!exists &&
+                    messageId.isNotEmpty &&
+                    !_locallyConsumedOneTimeIds.contains(messageId)) {
                   _messages.add(newMessage);
                   _messages.sort(_compareMessageOrder);
                 }
@@ -455,10 +524,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   void _scrollToBottom() {
+    // With reverse:true the newest messages are at scroll offset 0.
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (_scrollController.hasClients) {
+      if (_scrollController.hasClients &&
+          _scrollController.position.minScrollExtent <
+              _scrollController.position.maxScrollExtent) {
         _scrollController.animateTo(
-          _scrollController.position.maxScrollExtent,
+          _scrollController.position.minScrollExtent,
           duration: const Duration(milliseconds: 250),
           curve: Curves.easeOut,
         );
@@ -663,13 +735,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               contentType: mimeType,
             ),
           );
-      final publicUrl =
-          supabase.storage.from('chat_attachments').getPublicUrl(objectPath);
 
       final payload = _MessagePayload(
         type: type,
         text: '',
-        url: publicUrl,
+        path: objectPath,
         fileName: safeName,
         mimeType: mimeType,
         oneTime: oneTime,
@@ -818,8 +888,26 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _hideMessageLocally(String messageId) async {
+  Future<void> _hideMessageLocally(
+    String messageId, {
+    bool consumeOneTime = false,
+  }) async {
     if (messageId.isEmpty) return;
+    if (consumeOneTime) {
+      await _consumeOneTimeLocally(messageId);
+      final archived = await _vaultService.archiveOneTimeMessage(messageId);
+      if (!mounted) return;
+      setState(() {
+        _messages.removeWhere((m) => (m['id'] ?? '').toString() == messageId);
+        _selectedMessageIds.remove(messageId);
+        _hiddenMessageIds.add(messageId);
+      });
+      if (!archived) {
+        await _persistHiddenMessages();
+      }
+      return;
+    }
+
     setState(() {
       _hiddenMessageIds.add(messageId);
       _selectedMessageIds.remove(messageId);
@@ -850,31 +938,101 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Future<void> _onMessageTap({
     required String messageId,
     required _MessagePayload payload,
-    required bool isMe,
   }) async {
     if (_selectionMode) {
       _onMessageLongPress(messageId);
       return;
     }
-    if (payload.isImage && payload.url != null) {
-      if (payload.oneTime && isMe) return;
-      await _openImage(payload);
+    if (payload.isImage && payload.hasAttachmentRef) {
       if (payload.oneTime) {
-        await _hideMessageLocally(messageId);
+        final opened = await _openImage(payload);
+        if (opened) {
+          await _hideMessageLocally(messageId, consumeOneTime: true);
+        }
+        return;
       }
+      await _openImage(payload);
       return;
     }
-    if (payload.isFile && payload.url != null) {
+    if (payload.isFile && payload.hasAttachmentRef) {
       await _openFileInfo(payload);
       return;
     }
-    if (payload.oneTime && !isMe) {
-      await _hideMessageLocally(messageId);
+    if (payload.oneTime) {
+      await _hideMessageLocally(messageId, consumeOneTime: true);
     }
   }
 
-  Future<void> _openImage(_MessagePayload payload) async {
-    if (!mounted || payload.url == null) return;
+  Future<String?> _createSignedAttachmentUrl(
+    _MessagePayload payload, {
+    int expiresInSeconds = 3600,
+  }) async {
+    final objectPath = payload.resolvedPath;
+    if (objectPath == null || objectPath.isEmpty) return null;
+    try {
+      return await supabase.storage
+          .from(_MessagePayload.attachmentBucket)
+          .createSignedUrl(objectPath, expiresInSeconds);
+    } catch (e) {
+      debugPrint('Signed URL create failed for $objectPath: $e');
+      return null;
+    }
+  }
+
+  Future<bool> _openImage(_MessagePayload payload) async {
+    if (!mounted) return false;
+    final objectPath = payload.resolvedPath;
+    if (objectPath == null || objectPath.isEmpty) {
+      _showSnack('Görsel yolu bulunamadı.');
+      return false;
+    }
+
+    Uint8List? bytes;
+    try {
+      bytes = await supabase.storage
+          .from(_MessagePayload.attachmentBucket)
+          .download(objectPath);
+    } catch (e) {
+      debugPrint('Attachment download failed for $objectPath: $e');
+    }
+
+    if (bytes != null && mounted) {
+      await showDialog<void>(
+        context: context,
+        builder: (ctx) => Dialog(
+          backgroundColor: Colors.black,
+          child: Stack(
+            children: [
+              InteractiveViewer(
+                child: Image.memory(
+                  bytes!,
+                  fit: BoxFit.contain,
+                ),
+              ),
+              Positioned(
+                right: 8,
+                top: 8,
+                child: IconButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  icon: const Icon(Icons.close, color: Colors.white),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+      return true;
+    }
+
+    final signedUrl = await _createSignedAttachmentUrl(
+      payload,
+      expiresInSeconds: 900,
+    );
+    if (!mounted || signedUrl == null) {
+      _showSnack('Görsele erişilemedi.');
+      return false;
+    }
+
     await showDialog<void>(
       context: context,
       builder: (ctx) => Dialog(
@@ -883,8 +1041,24 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           children: [
             InteractiveViewer(
               child: Image.network(
-                payload.url!,
+                signedUrl,
                 fit: BoxFit.contain,
+                errorBuilder: (_, err, __) {
+                  final detail = err.toString();
+                  return Container(
+                    color: Colors.black,
+                    alignment: Alignment.center,
+                    padding: const EdgeInsets.all(12),
+                    child: Text(
+                      'Görsel yüklenemedi.\n$detail',
+                      textAlign: TextAlign.center,
+                      style: GoogleFonts.orbitron(
+                        color: Colors.white70,
+                        fontSize: 11,
+                      ),
+                    ),
+                  );
+                },
               ),
             ),
             Positioned(
@@ -899,10 +1073,16 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ),
       ),
     );
+    return false;
   }
 
   Future<void> _openFileInfo(_MessagePayload payload) async {
-    if (!mounted || payload.url == null) return;
+    if (!mounted) return;
+    final signedUrl = await _createSignedAttachmentUrl(payload);
+    if (!mounted || signedUrl == null) {
+      _showSnack('Dosyaya erişilemedi.');
+      return;
+    }
     await showDialog<void>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -912,13 +1092,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           style: GoogleFonts.orbitron(color: kTextPrimary),
         ),
         content: SelectableText(
-          payload.url!,
+          signedUrl,
           style: GoogleFonts.orbitron(color: kTextSecondary, fontSize: 11),
         ),
         actions: [
           TextButton(
             onPressed: () async {
-              await Clipboard.setData(ClipboardData(text: payload.url!));
+              await Clipboard.setData(ClipboardData(text: signedUrl));
               if (ctx.mounted) Navigator.pop(ctx);
               _showSnack('Dosya linki kopyalandı.');
             },
@@ -941,9 +1121,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   @override
   Widget build(BuildContext context) {
-    final visibleMessages = _messages
-        .where((m) => !_hiddenMessageIds.contains((m['id'] ?? '').toString()))
-        .toList();
+    final visibleMessages = _messages.where((m) {
+      final id = (m['id'] ?? '').toString().trim();
+      return !_hiddenMessageIds.contains(id) &&
+          !_locallyConsumedOneTimeIds.contains(id);
+    }).toList();
 
     return Scaffold(
       backgroundColor: kBackground,
@@ -980,16 +1162,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
               icon: const Icon(Icons.delete_outline, color: kAccentRed),
             )
           else ...[
-            IconButton(
-              tooltip: _timerEnabled
-                  ? 'Zamanlayıcı açık (kapat)'
-                  : 'Zamanlayıcı kapalı (aç)',
-              onPressed: _toggleTimer,
-              icon: Icon(
-                _timerEnabled ? Icons.timer : Icons.timer_off_outlined,
-                color: _timerEnabled ? kAccentGreen : kTextSecondary,
-              ),
-            ),
             IconButton(
               tooltip: 'Mesajları temizle',
               onPressed: _confirmClearMessages,
@@ -1039,11 +1211,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                         )
                       : ListView.builder(
                           controller: _scrollController,
+                          reverse: true,
                           padding: const EdgeInsets.symmetric(
                               horizontal: 12, vertical: 8),
                           itemCount: visibleMessages.length,
                           itemBuilder: (context, index) {
-                            final msg = visibleMessages[index];
+                            final msg = visibleMessages[
+                                visibleMessages.length - 1 - index];
                             final messageId = (msg['id'] ?? '').toString();
                             final payload = _MessagePayload.decode(
                               (msg['content'] ?? '').toString(),
@@ -1072,7 +1246,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                               onTap: () => _onMessageTap(
                                 messageId: messageId,
                                 payload: payload,
-                                isMe: isMe,
                               ),
                               child: _MessageBubble(
                                 payload: payload,
@@ -1267,7 +1440,7 @@ class _MessageBubble extends StatelessWidget {
                   fontSize: 13,
                 ),
               ),
-            if (payload.isImage && payload.url != null) ...[
+            if (payload.isImage && payload.hasAttachmentRef) ...[
               Container(
                 width: 160,
                 height: 90,
@@ -1309,7 +1482,7 @@ class _MessageBubble extends StatelessWidget {
                 ),
               ),
             ],
-            if (payload.isFile && payload.url != null) ...[
+            if (payload.isFile && payload.hasAttachmentRef) ...[
               Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -1356,6 +1529,7 @@ class _MessageBubble extends StatelessWidget {
 
 class _MessagePayload {
   static const prefix = '__boomyou_payload_v1__';
+  static const attachmentBucket = 'chat_attachments';
   static const typeText = 'text';
   static const typeImage = 'image';
   static const typeFile = 'file';
@@ -1363,6 +1537,7 @@ class _MessagePayload {
   final String type;
   final String text;
   final String? url;
+  final String? path;
   final String? fileName;
   final String? mimeType;
   final bool oneTime;
@@ -1371,6 +1546,7 @@ class _MessagePayload {
     required this.type,
     required this.text,
     this.url,
+    this.path,
     this.fileName,
     this.mimeType,
     this.oneTime = false,
@@ -1379,12 +1555,36 @@ class _MessagePayload {
   bool get isText => type == typeText;
   bool get isImage => type == typeImage;
   bool get isFile => type == typeFile;
+  bool get hasAttachmentRef =>
+      (resolvedPath?.isNotEmpty ?? false) || (url?.trim().isNotEmpty ?? false);
+
+  String? get resolvedPath {
+    final direct = (path ?? '').trim();
+    if (direct.isNotEmpty) return direct;
+
+    final rawUrl = (url ?? '').trim();
+    if (rawUrl.isEmpty) return null;
+
+    try {
+      final parsed = Uri.parse(rawUrl);
+      final marker = '/$attachmentBucket/';
+      final fullPath = parsed.path;
+      final markerIndex = fullPath.indexOf(marker);
+      if (markerIndex == -1) return null;
+      final extracted = fullPath.substring(markerIndex + marker.length).trim();
+      if (extracted.isEmpty) return null;
+      return Uri.decodeComponent(extracted);
+    } catch (_) {
+      return null;
+    }
+  }
 
   String encode() {
     return '$prefix${jsonEncode({
           'type': type,
           'text': text,
           'url': url,
+          'path': path,
           'fileName': fileName,
           'mimeType': mimeType,
           'oneTime': oneTime,
@@ -1402,6 +1602,7 @@ class _MessagePayload {
         type: (data['type'] ?? typeText).toString(),
         text: (data['text'] ?? '').toString(),
         url: data['url']?.toString(),
+        path: data['path']?.toString(),
         fileName: data['fileName']?.toString(),
         mimeType: data['mimeType']?.toString(),
         oneTime: data['oneTime'] == true,

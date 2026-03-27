@@ -15,6 +15,7 @@ class AttachmentGalleryScreen extends StatefulWidget {
 
 class _AttachmentGalleryScreenState extends State<AttachmentGalleryScreen> {
   List<FileObject> _files = [];
+  final Map<String, String> _signedUrlsByName = {};
   bool _isLoading = true;
 
   @override
@@ -26,34 +27,52 @@ class _AttachmentGalleryScreenState extends State<AttachmentGalleryScreen> {
   Future<void> _loadFiles() async {
     try {
       final userId = supabase.auth.currentUser?.id;
-      if (userId == null) return;
+      if (userId == null) {
+        if (!mounted) return;
+        setState(() {
+          _files = [];
+          _signedUrlsByName.clear();
+          _isLoading = false;
+        });
+        return;
+      }
 
-      final files = await supabase.storage
-          .from('chat_attachments')
-          .list(path: userId);
+      final files =
+          await supabase.storage.from('chat_attachments').list(path: userId);
+
+      final imageFiles = files
+          .where((f) =>
+              f.name.endsWith('.jpg') ||
+              f.name.endsWith('.jpeg') ||
+              f.name.endsWith('.png'))
+          .toList()
+        ..sort((a, b) => (b.createdAt ?? '').compareTo(a.createdAt ?? ''));
+
+      final signedUrls = <String, String>{};
+      for (final file in imageFiles) {
+        final objectPath = '$userId/${file.name}';
+        try {
+          final signedUrl = await supabase.storage
+              .from('chat_attachments')
+              .createSignedUrl(objectPath, 3600);
+          signedUrls[file.name] = signedUrl;
+        } catch (_) {
+          // Skip files that cannot be signed right now.
+        }
+      }
 
       if (!mounted) return;
       setState(() {
-        _files = files
-            .where((f) =>
-                f.name.endsWith('.jpg') ||
-                f.name.endsWith('.jpeg') ||
-                f.name.endsWith('.png'))
-            .toList()
-          ..sort((a, b) => (b.createdAt ?? '').compareTo(a.createdAt ?? ''));
+        _files = imageFiles;
+        _signedUrlsByName
+          ..clear()
+          ..addAll(signedUrls);
         _isLoading = false;
       });
     } catch (e) {
       if (!mounted) return;
       setState(() => _isLoading = false);
     }
-  }
-
-  String _getPublicUrl(String fileName) {
-    final userId = supabase.auth.currentUser?.id ?? 'anon';
-    return supabase.storage
-        .from('chat_attachments')
-        .getPublicUrl('$userId/$fileName');
   }
 
   void _openImage(String url) {
@@ -127,7 +146,19 @@ class _AttachmentGalleryScreenState extends State<AttachmentGalleryScreen> {
                   itemCount: _files.length,
                   itemBuilder: (context, index) {
                     final file = _files[index];
-                    final url = _getPublicUrl(file.name);
+                    final url = _signedUrlsByName[file.name];
+                    if (url == null || url.isEmpty) {
+                      return Container(
+                        decoration: BoxDecoration(
+                          color: kBombBody,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Icon(
+                          Icons.broken_image_outlined,
+                          color: kTextSecondary,
+                        ),
+                      );
+                    }
                     return GestureDetector(
                       onTap: () => _openImage(url),
                       child: ClipRRect(

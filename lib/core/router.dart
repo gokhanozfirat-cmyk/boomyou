@@ -23,19 +23,27 @@ final appRouter = GoRouter(
     ),
     GoRoute(
       path: '/vault/:vaultId',
-      builder: (context, state) => VaultHomeScreen(
-        vaultId: state.pathParameters['vaultId']!,
-      ),
+      builder: (context, state) {
+        final existingSession =
+            state.uri.queryParameters['existingSession'] == '1';
+        return VaultHomeScreen(
+          vaultId: state.pathParameters['vaultId']!,
+          existingSession: existingSession,
+        );
+      },
     ),
     GoRoute(
       path: '/chat/:conversationId',
       builder: (context, state) {
         final conversationId = state.pathParameters['conversationId']!;
         final activeVaultId = state.uri.queryParameters['vaultId'];
+        final historyLocked = state.uri.queryParameters['historyLocked'] == '1';
         return ChatScreen(
-          key: ValueKey('chat:$conversationId:${activeVaultId ?? ""}'),
+          key: ValueKey(
+              'chat:$conversationId:${activeVaultId ?? ""}:$historyLocked'),
           conversationId: conversationId,
           activeVaultId: activeVaultId,
+          historyLocked: historyLocked,
         );
       },
     ),

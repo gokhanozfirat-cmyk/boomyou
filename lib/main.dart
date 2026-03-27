@@ -1,12 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
-import 'package:firebase_core/firebase_core.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'core/router.dart';
 import 'core/theme.dart';
 import 'services/auth_service.dart';
-import 'services/notification_service.dart';
 import 'services/vault_service.dart';
 
 Future<void> main() async {
@@ -20,9 +18,6 @@ Future<void> main() async {
 
   // Load environment variables
   await dotenv.load(fileName: '.env');
-
-  // Initialize Firebase for FCM
-  await Firebase.initializeApp();
 
   // Initialize Supabase
   await Supabase.initialize(
@@ -45,17 +40,17 @@ Future<void> main() async {
     await vaultService.initDefaultVault();
   } catch (_) {}
 
-  // Initialize push notifications (FCM token + permission sync)
-  try {
-    await NotificationService().initialize();
-  } catch (_) {}
-
   runApp(const BoomYouApp());
 }
 
-class BoomYouApp extends StatelessWidget {
+class BoomYouApp extends StatefulWidget {
   const BoomYouApp({super.key});
 
+  @override
+  State<BoomYouApp> createState() => _BoomYouAppState();
+}
+
+class _BoomYouAppState extends State<BoomYouApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp.router(
