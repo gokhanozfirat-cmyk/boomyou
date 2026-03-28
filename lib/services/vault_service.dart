@@ -98,6 +98,28 @@ class VaultService {
     return null;
   }
 
+  Future<String?> checkCodeGuardedForGame(String code) async {
+    final normalizedCode = code.trim();
+    if (!RegExp(r'^\d{6}$').hasMatch(normalizedCode)) return null;
+
+    try {
+      final result = await supabase.rpc(
+        'check_vault_code_guarded',
+        params: {'input_code': normalizedCode},
+      );
+      if (result == null) return null;
+
+      final vaultId = result.toString().trim();
+      return vaultId.isEmpty ? null : vaultId;
+    } on PostgrestException catch (e) {
+      // Backward compatibility for environments where migration is not applied.
+      if (e.code == '42883') {
+        return checkCode(normalizedCode);
+      }
+      rethrow;
+    }
+  }
+
   Future<bool> isVaultSetup(String vaultId) async {
     final result = await supabase
         .from('vaults')

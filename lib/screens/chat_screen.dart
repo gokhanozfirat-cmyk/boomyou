@@ -239,6 +239,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   void _startAutoExpireTimer() {
+    if (widget.historyLocked) return;
     _autoExpireTimer?.cancel();
     // Check every minute
     _autoExpireTimer = Timer.periodic(const Duration(minutes: 1), (_) {
@@ -267,7 +268,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   }
 
   Future<void> _expireReadMessages() async {
-    if (!mounted || _isExpiringMessages) return;
+    if (!mounted || _isExpiringMessages || widget.historyLocked) return;
     _isExpiringMessages = true;
 
     try {
@@ -275,18 +276,14 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       final resolvedVaultId = currentVaultId.isNotEmpty
           ? currentVaultId
           : await _vaultService.checkMyConversationVault(widget.conversationId);
-      if (resolvedVaultId != null && resolvedVaultId.isNotEmpty) {
-        _myVaultId ??= resolvedVaultId;
-      }
+      if (resolvedVaultId == null || resolvedVaultId.isEmpty) return;
+      _myVaultId ??= resolvedVaultId;
 
-      DateTime? readAt;
-      if (resolvedVaultId != null && resolvedVaultId.isNotEmpty) {
-        readAt = await _vaultService.getConversationLastReadAt(
-          widget.conversationId,
-          resolvedVaultId,
-        );
-      }
-      readAt ??= DateTime.now().toUtc();
+      final readAt = await _vaultService.getConversationLastReadAt(
+        widget.conversationId,
+        resolvedVaultId,
+      );
+      if (readAt == null) return;
 
       // Archive only messages that are both:
       // 1) already read in this vault, and
@@ -302,20 +299,24 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       );
       if (!mounted || archivedCount <= 0) return;
 
-      final cutoff = archiveBefore.add(const Duration(seconds: 1));
-      final removedIds = <String>{};
+      // Refresh from DB so UI removes only what was actually archived.
+      var refreshed = await _vaultService.getMessages(widget.conversationId);
+      refreshed = refreshed
+          .where((m) => !_locallyConsumedOneTimeIds
+              .contains((m['id'] ?? '').toString().trim()))
+          .toList();
+      refreshed.sort(_compareMessageOrder);
+
+      if (!mounted) return;
+      final refreshedIds = refreshed
+          .map((m) => (m['id'] ?? '').toString())
+          .where((id) => id.isNotEmpty)
+          .toSet();
 
       setState(() {
-        _messages = _messages.where((msg) {
-          final createdAt =
-              DateTime.tryParse((msg['created_at'] ?? '').toString());
-          if (createdAt == null || createdAt.isAfter(cutoff)) return true;
-          final messageId = (msg['id'] ?? '').toString();
-          if (messageId.isNotEmpty) removedIds.add(messageId);
-          return false;
-        }).toList();
-        _hiddenMessageIds.removeAll(removedIds);
-        _selectedMessageIds.removeAll(removedIds);
+        _messages = refreshed;
+        _hiddenMessageIds.removeWhere((id) => !refreshedIds.contains(id));
+        _selectedMessageIds.removeWhere((id) => !refreshedIds.contains(id));
       });
     } finally {
       _isExpiringMessages = false;

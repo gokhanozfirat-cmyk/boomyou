@@ -6,6 +6,7 @@ import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:go_router/go_router.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/navigation_observer.dart';
 import '../core/theme.dart';
@@ -39,9 +40,20 @@ class _GameScreenState extends State<GameScreen>
   int _bombIdCounter = 0;
   bool _loopPaused = false;
   ModalRoute<dynamic>? _route;
+  int _failedSixDigitAttempts = 0;
+  DateTime? _sixDigitLockoutUntil;
+  bool _nextSixDigitLockIsLong = false;
 
   static const double _bombWidth = 70.0;
   static const double _bombHeight = 70.0;
+  static const int _maxFailedSixDigitAttempts = 5;
+  static const Duration _sixDigitShortLockDuration = Duration(minutes: 10);
+  static const Duration _sixDigitLongLockDuration = Duration(hours: 24);
+  static const String _failedSixDigitAttemptsKey =
+      'game_failed_six_digit_attempts';
+  static const String _sixDigitLockoutUntilKey = 'game_six_digit_lockout_until';
+  static const String _nextSixDigitLockModeKey =
+      'game_next_six_digit_lock_long';
 
   int get _level => (_score ~/ 50) + 1;
 
@@ -52,6 +64,7 @@ class _GameScreenState extends State<GameScreen>
 
     _ticker = createTicker(_onTick)..start();
     _scheduleNextSpawn();
+    unawaited(_loadCodeGuardState());
 
     Future.delayed(const Duration(milliseconds: 400), () {
       if (mounted) _inputFocus.requestFocus();
@@ -201,42 +214,54 @@ class _GameScreenState extends State<GameScreen>
     if (input.isEmpty) return;
     _inputController.clear();
 
-    try {
-      final vaultId = await _vaultService.checkCode(input);
-      if (!mounted) return;
+    final isSixDigitInput = RegExp(r'^\d{6}$').hasMatch(input);
 
-      if (vaultId != null) {
-        _pauseLoop();
-        bool isSetup = true;
-        try {
-          isSetup = await _vaultService.isVaultSetup(vaultId);
-        } catch (_) {
-          // If setup status lookup fails, still try to open the vault screen.
-          isSetup = true;
-        }
-        if (!mounted) return;
-
-        if (isSetup) {
-          await context.push('/vault/$vaultId');
-        } else {
-          await context.push('/vault-setup/$vaultId');
-        }
-
-        if (mounted) {
-          _resumeLoop();
-          _inputFocus.requestFocus();
-        }
+    // Vault code checks are processed only for 6-digit inputs.
+    if (isSixDigitInput) {
+      // Silent lock: bypass all 6-digit attempts during active lock window.
+      if (_isSixDigitLockActive()) {
+        if (mounted) _inputFocus.requestFocus();
         return;
       }
-    } catch (_) {
-      if (!mounted) return;
-      _showFailFlashOnce();
-      _inputFocus.requestFocus();
-      return;
-    }
 
-    // If user entered a 6-digit number, treat it as vault code attempt.
-    if (RegExp(r'^\d{6}$').hasMatch(input)) {
+      try {
+        final vaultId = await _vaultService.checkCodeGuardedForGame(input);
+        if (!mounted) return;
+
+        if (vaultId != null) {
+          await _resetSixDigitGuard();
+          _pauseLoop();
+          bool isSetup = true;
+          try {
+            isSetup = await _vaultService.isVaultSetup(vaultId);
+          } catch (_) {
+            // If setup status lookup fails, still try to open the vault screen.
+            isSetup = true;
+          }
+          if (!mounted) return;
+
+          if (isSetup) {
+            await context.push('/vault/$vaultId');
+          } else {
+            await context.push('/vault-setup/$vaultId');
+          }
+
+          if (mounted) {
+            _resumeLoop();
+            _inputFocus.requestFocus();
+          }
+          return;
+        }
+      } catch (_) {
+        await _registerFailedSixDigitAttempt();
+        if (!mounted) return;
+        _showFailFlashOnce();
+        _inputFocus.requestFocus();
+        return;
+      }
+
+      await _registerFailedSixDigitAttempt();
+      if (!mounted) return;
       _showFailFlashOnce();
       _inputFocus.requestFocus();
       return;
@@ -258,6 +283,62 @@ class _GameScreenState extends State<GameScreen>
 
     _showFailFlashOnce();
     _inputFocus.requestFocus();
+  }
+
+  Future<void> _loadCodeGuardState() async {
+    final prefs = await SharedPreferences.getInstance();
+    _failedSixDigitAttempts = prefs.getInt(_failedSixDigitAttemptsKey) ?? 0;
+    _nextSixDigitLockIsLong = prefs.getBool(_nextSixDigitLockModeKey) ?? false;
+    final rawLockout = prefs.getString(_sixDigitLockoutUntilKey);
+    final parsedLockout =
+        rawLockout == null ? null : DateTime.tryParse(rawLockout)?.toUtc();
+    _sixDigitLockoutUntil = parsedLockout;
+    if (!_isSixDigitLockActive() && _failedSixDigitAttempts != 0) {
+      await _persistCodeGuardState();
+    }
+  }
+
+  Future<void> _persistCodeGuardState() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt(_failedSixDigitAttemptsKey, _failedSixDigitAttempts);
+    await prefs.setBool(_nextSixDigitLockModeKey, _nextSixDigitLockIsLong);
+    if (_sixDigitLockoutUntil == null) {
+      await prefs.remove(_sixDigitLockoutUntilKey);
+    } else {
+      await prefs.setString(
+        _sixDigitLockoutUntilKey,
+        _sixDigitLockoutUntil!.toUtc().toIso8601String(),
+      );
+    }
+  }
+
+  bool _isSixDigitLockActive() {
+    final until = _sixDigitLockoutUntil;
+    if (until == null) return false;
+    if (DateTime.now().toUtc().isBefore(until)) return true;
+    _failedSixDigitAttempts = 0;
+    _sixDigitLockoutUntil = null;
+    unawaited(_persistCodeGuardState());
+    return false;
+  }
+
+  Future<void> _resetSixDigitGuard() async {
+    _failedSixDigitAttempts = 0;
+    _sixDigitLockoutUntil = null;
+    await _persistCodeGuardState();
+  }
+
+  Future<void> _registerFailedSixDigitAttempt() async {
+    _failedSixDigitAttempts += 1;
+    if (_failedSixDigitAttempts >= _maxFailedSixDigitAttempts) {
+      _failedSixDigitAttempts = 0;
+      final lockDuration = _nextSixDigitLockIsLong
+          ? _sixDigitLongLockDuration
+          : _sixDigitShortLockDuration;
+      _sixDigitLockoutUntil = DateTime.now().toUtc().add(lockDuration);
+      _nextSixDigitLockIsLong = !_nextSixDigitLockIsLong;
+    }
+    await _persistCodeGuardState();
   }
 
   void _showFailFlashOnce() {
