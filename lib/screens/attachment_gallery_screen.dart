@@ -18,6 +18,33 @@ class _AttachmentGalleryScreenState extends State<AttachmentGalleryScreen> {
   final Map<String, String> _signedUrlsByName = {};
   bool _isLoading = true;
 
+  String? _normalizeSignedUrl(String? rawUrl) {
+    final value = (rawUrl ?? '').trim();
+    if (value.isEmpty) return null;
+
+    final parsed = Uri.tryParse(value);
+    if (parsed != null && parsed.hasScheme) {
+      return parsed.toString();
+    }
+
+    final storageBase = supabase.storage.url.replaceAll(RegExp(r'/$'), '');
+    final projectBase = storageBase.replaceFirst(RegExp(r'/storage/v1$'), '');
+
+    if (value.startsWith('/storage/v1/')) {
+      return '$projectBase$value';
+    }
+
+    if (value.startsWith('/')) {
+      return '$storageBase$value';
+    }
+
+    if (value.startsWith('storage/v1/')) {
+      return '$projectBase/$value';
+    }
+
+    return '$storageBase/$value';
+  }
+
   @override
   void initState() {
     super.initState();
@@ -55,7 +82,10 @@ class _AttachmentGalleryScreenState extends State<AttachmentGalleryScreen> {
           final signedUrl = await supabase.storage
               .from('chat_attachments')
               .createSignedUrl(objectPath, 3600);
-          signedUrls[file.name] = signedUrl;
+          final normalizedSignedUrl = _normalizeSignedUrl(signedUrl);
+          if (normalizedSignedUrl != null && normalizedSignedUrl.isNotEmpty) {
+            signedUrls[file.name] = normalizedSignedUrl;
+          }
         } catch (_) {
           // Skip files that cannot be signed right now.
         }

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../core/supabase_client.dart';
 import 'auth_service.dart';
@@ -498,6 +499,19 @@ class VaultService {
     } catch (_) {
       // Backward compatibility: table may not exist yet.
     }
+
+    // Stamp read_at on messages from the other party (first read only).
+    try {
+      await supabase.rpc(
+        'mark_messages_read_at',
+        params: {
+          'input_conversation_id': conversationId,
+          'input_reader_vault_id': vaultId,
+        },
+      );
+    } catch (_) {
+      // Backward compatibility: RPC may not exist yet.
+    }
   }
 
   Future<Set<String>> loadHiddenMessageIds(String vaultId) async {
@@ -550,32 +564,53 @@ class VaultService {
     String token, {
     required String platform,
     required bool notificationsEnabled,
+    bool vibrationEnabled = true,
   }) async {
     final userId = _auth.currentUserId;
-    if (userId == null) return;
+    if (userId == null) {
+      debugPrint('Push token upsert skipped: current user is null.');
+      return;
+    }
     final normalizedToken = token.trim();
     if (normalizedToken.isEmpty) return;
 
     final now = DateTime.now().toUtc().toIso8601String();
+    final payload = {
+      'token': normalizedToken,
+      'user_id': userId,
+      'platform': platform,
+      'notifications_enabled': notificationsEnabled,
+      'vibration_enabled': vibrationEnabled,
+      'updated_at': now,
+    };
     try {
       await supabase.from('device_push_tokens').upsert(
-        {
-          'token': normalizedToken,
-          'user_id': userId,
-          'platform': platform,
-          'notifications_enabled': notificationsEnabled,
-          'updated_at': now,
-        },
-        onConflict: 'token',
-      );
-    } catch (_) {
-      // Backward compatibility: table may not exist yet.
+            payload,
+            onConflict: 'token',
+          );
+    } catch (e) {
+      // Backward compatibility: older schema may not have vibration_enabled.
+      debugPrint('Push token upsert fallback due to error: $e');
+      final fallbackPayload = Map<String, dynamic>.from(payload)
+        ..remove('vibration_enabled');
+      try {
+        await supabase.from('device_push_tokens').upsert(
+              fallbackPayload,
+              onConflict: 'token',
+            );
+      } catch (fallbackError) {
+        // Backward compatibility: table may not exist yet.
+        debugPrint('Push token upsert failed: $fallbackError');
+      }
     }
   }
 
   Future<void> clearPushTokensForCurrentUser() async {
     final userId = _auth.currentUserId;
-    if (userId == null) return;
+    if (userId == null) {
+      debugPrint('Push token clear skipped: current user is null.');
+      return;
+    }
 
     final now = DateTime.now().toUtc().toIso8601String();
     try {
@@ -907,6 +942,20 @@ class VaultService {
         return;
       }
       rethrow;
+    }
+
+    // Fire-and-forget push notification to the other party.
+    try {
+      await supabase.functions.invoke(
+        'send-message-push',
+        body: {
+          'conversation_id': conversationId,
+          'sender_id': userId,
+          if (resolvedVaultId != null) 'sender_vault_id': resolvedVaultId,
+        },
+      );
+    } catch (_) {
+      // Push is best-effort; never block message sending.
     }
   }
 

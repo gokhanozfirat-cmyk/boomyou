@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -6,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:vibration/vibration.dart';
 
 import 'vault_service.dart';
 
@@ -14,12 +16,33 @@ class NotificationService {
   factory NotificationService() => _instance;
   NotificationService._internal();
 
-  static const String _channelId = 'boomyou_messages_v2';
-  static const String _channelName = 'BoomYou Messages';
+  static const String _androidVibrateChannelId = 'boomyou_messages_v3_vibrate';
+  static const String _androidVibrateChannelName = 'BoomYou Messages';
+  static const String _androidSilentChannelId = 'boomyou_messages_v3_silent';
+  static const String _androidSilentChannelName =
+      'BoomYou Messages (No Vibration)';
   static const String _channelDescription = 'BoomYou chat notifications';
 
+  static const List<String> _funTitles = [
+    'Oyun zaman\u{0131}! \u{1F3AE}',
+    'Haydi oyuna! \u{1F525}',
+    'BoomYou! \u{1F4A3}',
+    'Bomba haz\u{0131}r! \u{1F4A5}',
+    'S\u{0131}ra sende! \u{1F3AF}',
+  ];
+
+  static const List<String> _funBodies = [
+    'Haydi kasana gir, seni bekliyorlar!',
+    'Boom! Kasan\u{0131} patlatma vakti!',
+    'Rakibin hamlesini yapt\u{0131}, s\u{0131}ra sende!',
+    'Oyun ba\u{015F}l\u{0131}yor, haz\u{0131}r m\u{0131}s\u{0131}n?',
+    'Kasan\u{0131} a\u{00E7}, oyun seni bekliyor!',
+  ];
+
+  static final Random _rng = Random();
+
   final VaultService _vaultService = VaultService();
-  final FirebaseMessaging _messaging = FirebaseMessaging.instance;
+  FirebaseMessaging? _messaging;
   final FlutterLocalNotificationsPlugin _localNotifications =
       FlutterLocalNotificationsPlugin();
   StreamSubscription<String>? _tokenRefreshSub;
@@ -36,8 +59,10 @@ class NotificationService {
       debugPrint('FCM init skipped: $e');
       return;
     }
+    _messaging ??= FirebaseMessaging.instance;
+    final messaging = _messaging!;
 
-    final settings = await _messaging.requestPermission(
+    final settings = await messaging.requestPermission(
       alert: true,
       badge: true,
       sound: true,
@@ -47,26 +72,34 @@ class NotificationService {
       criticalAlert: false,
     );
 
-    final notificationsEnabled =
+    final notificationsPermissionGranted =
         settings.authorizationStatus == AuthorizationStatus.authorized ||
             settings.authorizationStatus == AuthorizationStatus.provisional;
     debugPrint(
-      'FCM permission status: ${settings.authorizationStatus.name} (enabled=$notificationsEnabled)',
+      'FCM permission status: ${settings.authorizationStatus.name} '
+      '(granted=$notificationsPermissionGranted)',
     );
 
     await _initializeLocalNotifications();
 
     if (defaultTargetPlatform == TargetPlatform.iOS) {
-      await _messaging.setForegroundNotificationPresentationOptions(
+      await messaging.setForegroundNotificationPresentationOptions(
         alert: true,
         badge: true,
         sound: true,
       );
     }
 
-    await _syncCurrentTokenWithRetry(enabled: notificationsEnabled);
+    await _syncCurrentTokenWithRetry(enabled: true);
 
-    _tokenRefreshSub = _messaging.onTokenRefresh.listen((token) async {
+    if (!notificationsPermissionGranted) {
+      debugPrint(
+        'Notifications permission is not granted yet. '
+        'FCM token sync still attempted for backend registration.',
+      );
+    }
+
+    _tokenRefreshSub = messaging.onTokenRefresh.listen((token) async {
       try {
         final normalized = token.trim();
         if (normalized.isEmpty) {
@@ -76,10 +109,13 @@ class NotificationService {
 
         final prefs = await SharedPreferences.getInstance();
         final pushEnabled = prefs.getBool('notif_push_enabled') ?? true;
+        final vibrationEnabled =
+            prefs.getBool('notif_vibration_enabled') ?? true;
         await _vaultService.upsertPushToken(
           normalized,
           platform: _platformLabel,
           notificationsEnabled: pushEnabled,
+          vibrationEnabled: vibrationEnabled,
         );
         debugPrint('FCM token refreshed: ${_maskToken(normalized)}');
       } catch (e) {
@@ -118,14 +154,22 @@ class NotificationService {
   }
 
   Future<bool> _syncCurrentToken({required bool enabled}) async {
-    if (!enabled) {
+    final messaging = _messaging;
+    if (messaging == null) {
+      debugPrint('FCM token sync skipped: FirebaseMessaging is not ready.');
+      return false;
+    }
+    final prefs = await SharedPreferences.getInstance();
+    final pushEnabled = prefs.getBool('notif_push_enabled') ?? true;
+    final vibrationEnabled = prefs.getBool('notif_vibration_enabled') ?? true;
+
+    if (!enabled || !pushEnabled) {
       await _vaultService.clearPushTokensForCurrentUser();
-      debugPrint('FCM token sync skipped: notifications disabled.');
       return true;
     }
 
     try {
-      final token = await _messaging.getToken();
+      final token = await messaging.getToken();
       if (token == null || token.trim().isEmpty) {
         debugPrint('FCM token unavailable (null/empty).');
         return false;
@@ -134,7 +178,8 @@ class NotificationService {
       await _vaultService.upsertPushToken(
         token,
         platform: _platformLabel,
-        notificationsEnabled: true,
+        notificationsEnabled: pushEnabled,
+        vibrationEnabled: vibrationEnabled,
       );
       debugPrint('FCM token synced: ${_maskToken(token)}');
       return true;
@@ -160,14 +205,25 @@ class NotificationService {
     await androidPlatform?.requestNotificationsPermission();
     await androidPlatform?.createNotificationChannel(
       AndroidNotificationChannel(
-        _channelId,
-        _channelName,
+        _androidVibrateChannelId,
+        _androidVibrateChannelName,
         description: _channelDescription,
         importance: Importance.high,
         playSound: true,
         enableVibration: true,
         enableLights: true,
         vibrationPattern: Int64List.fromList(<int>[0, 250, 160, 250]),
+      ),
+    );
+    await androidPlatform?.createNotificationChannel(
+      const AndroidNotificationChannel(
+        _androidSilentChannelId,
+        _androidSilentChannelName,
+        description: _channelDescription,
+        importance: Importance.high,
+        playSound: true,
+        enableVibration: false,
+        enableLights: true,
       ),
     );
 
@@ -192,8 +248,16 @@ class NotificationService {
 
   Future<void> _showForegroundNotification(RemoteMessage message) async {
     final remoteNotification = message.notification;
-    final title = (remoteNotification?.title ?? '').trim();
-    final body = (remoteNotification?.body ?? '').trim();
+    final remoteTitle = (remoteNotification?.title ?? '').trim();
+    final remoteBody = (remoteNotification?.body ?? '').trim();
+
+    // Use server-sent text if available, otherwise pick a fun random message.
+    final title = remoteTitle.isNotEmpty
+        ? remoteTitle
+        : _funTitles[_rng.nextInt(_funTitles.length)];
+    final body = remoteBody.isNotEmpty
+        ? remoteBody
+        : _funBodies[_rng.nextInt(_funBodies.length)];
 
     final prefs = await SharedPreferences.getInstance();
     final pushEnabled = prefs.getBool('notif_push_enabled') ?? true;
@@ -201,19 +265,31 @@ class NotificationService {
 
     // Always vibrate if vibration is enabled, regardless of push setting.
     if (vibrationEnabled) {
-      HapticFeedback.heavyImpact();
+      final hasVibrator = (await Vibration.hasVibrator()) == true;
+      if (hasVibrator) {
+        // Pattern: wait 0ms, vibrate 300ms, pause 200ms, vibrate 300ms
+        Vibration.vibrate(pattern: [0, 300, 200, 300]);
+      } else {
+        HapticFeedback.heavyImpact();
+      }
     }
 
-    if (!pushEnabled || (title.isEmpty && body.isEmpty)) return;
+    if (!pushEnabled) return;
+
+    final androidChannelId =
+        vibrationEnabled ? _androidVibrateChannelId : _androidSilentChannelId;
+    final androidChannelName = vibrationEnabled
+        ? _androidVibrateChannelName
+        : _androidSilentChannelName;
 
     await _localNotifications.show(
       message.hashCode,
-      title.isEmpty ? 'BoomYou' : title,
+      title,
       body,
       NotificationDetails(
         android: AndroidNotificationDetails(
-          _channelId,
-          _channelName,
+          androidChannelId,
+          androidChannelName,
           channelDescription: _channelDescription,
           importance: Importance.max,
           priority: Priority.high,

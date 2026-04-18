@@ -60,7 +60,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _isExpiringMessages = false;
 
   static const Duration _idleTimeout = Duration(seconds: 10);
-  static const Duration _expireDuration = Duration(hours: 1);
 
   String get _hiddenStoreKey =>
       'chat_hidden_${_myUserId ?? "anon"}_${widget.conversationId}';
@@ -279,23 +278,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       if (resolvedVaultId == null || resolvedVaultId.isEmpty) return;
       _myVaultId ??= resolvedVaultId;
 
-      final readAt = await _vaultService.getConversationLastReadAt(
-        widget.conversationId,
-        resolvedVaultId,
-      );
-      if (readAt == null) return;
-
-      // Archive only messages that are both:
-      // 1) already read in this vault, and
-      // 2) older than one hour from now.
+      // The SQL function now uses per-message read_at + 1 hour internally.
+      // We still pass readBefore for API compatibility but it is ignored.
       final nowUtc = DateTime.now().toUtc();
-      final oneHourAgo = nowUtc.subtract(_expireDuration);
-      final archiveBefore = readAt.isBefore(oneHourAgo) ? readAt : oneHourAgo;
-
       final archivedCount = await _vaultService.archiveExpiredReadMessages(
         conversationId: widget.conversationId,
         vaultId: resolvedVaultId,
-        readBefore: archiveBefore,
+        readBefore: nowUtc,
       );
       if (!mounted || archivedCount <= 0) return;
 
@@ -939,6 +928,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   Future<void> _onMessageTap({
     required String messageId,
     required _MessagePayload payload,
+    required bool isMe,
   }) async {
     if (_selectionMode) {
       _onMessageLongPress(messageId);
@@ -946,6 +936,10 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     }
     if (payload.isImage && payload.hasAttachmentRef) {
       if (payload.oneTime) {
+        if (isMe) {
+          _showSnack('Alıcı açana kadar bekle.');
+          return;
+        }
         final opened = await _openImage(payload);
         if (opened) {
           await _hideMessageLocally(messageId, consumeOneTime: true);
@@ -959,42 +953,218 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       await _openFileInfo(payload);
       return;
     }
-    if (payload.oneTime) {
+    if (payload.oneTime && !isMe) {
       await _hideMessageLocally(messageId, consumeOneTime: true);
     }
+  }
+
+  String _normalizeAttachmentPath(String? rawPath, {bool decode = true}) {
+    var path = (rawPath ?? '').trim();
+    if (path.isEmpty) return '';
+
+    if (decode) {
+      try {
+        path = Uri.decodeComponent(path);
+      } catch (_) {}
+    }
+
+    if (path.startsWith('http://') || path.startsWith('https://')) {
+      final uri = Uri.tryParse(path);
+      if (uri != null) {
+        final marker = '/${_MessagePayload.attachmentBucket}/';
+        final markerIndex = uri.path.indexOf(marker);
+        if (markerIndex >= 0) {
+          path = uri.path.substring(markerIndex + marker.length);
+        } else {
+          path = uri.path;
+        }
+      }
+    }
+
+    path = path.split('#').first.split('?').first;
+    path = path.replaceFirst(RegExp(r'^/+'), '');
+
+    final prefixes = <String>[
+      'storage/v1/object/sign/${_MessagePayload.attachmentBucket}/',
+      'storage/v1/object/public/${_MessagePayload.attachmentBucket}/',
+      'storage/v1/object/authenticated/${_MessagePayload.attachmentBucket}/',
+      'object/sign/${_MessagePayload.attachmentBucket}/',
+      'object/public/${_MessagePayload.attachmentBucket}/',
+      'object/authenticated/${_MessagePayload.attachmentBucket}/',
+      '${_MessagePayload.attachmentBucket}/',
+    ];
+
+    for (final prefix in prefixes) {
+      if (path.startsWith(prefix)) {
+        path = path.substring(prefix.length);
+        break;
+      }
+    }
+
+    final midMarker = '/${_MessagePayload.attachmentBucket}/';
+    final midIndex = path.indexOf(midMarker);
+    if (midIndex >= 0) {
+      path = path.substring(midIndex + midMarker.length);
+    }
+
+    return path.trim();
+  }
+
+  String _extractAttachmentPathFromUrl(
+    String? rawUrl, {
+    bool decode = true,
+  }) {
+    final url = (rawUrl ?? '').trim();
+    if (url.isEmpty) return '';
+
+    try {
+      final parsed = Uri.parse(url);
+      final marker = '/${_MessagePayload.attachmentBucket}/';
+      final markerIndex = parsed.path.indexOf(marker);
+      if (markerIndex == -1) return '';
+      var extracted = parsed.path.substring(markerIndex + marker.length);
+      extracted = extracted.split('#').first.split('?').first.trim();
+      if (decode) {
+        try {
+          extracted = Uri.decodeComponent(extracted);
+        } catch (_) {}
+      }
+      return extracted.trim();
+    } catch (_) {
+      return '';
+    }
+  }
+
+  List<String> _buildAttachmentPathCandidates(_MessagePayload payload) {
+    final candidates = <String>[];
+    final seen = <String>{};
+
+    void addCandidate(String value) {
+      final normalized = value.trim();
+      if (normalized.isEmpty) return;
+      if (seen.add(normalized)) {
+        candidates.add(normalized);
+      }
+    }
+
+    addCandidate(_normalizeAttachmentPath(payload.path));
+    addCandidate(_normalizeAttachmentPath(payload.path, decode: false));
+    addCandidate(_normalizeAttachmentPath(payload.resolvedPath));
+    addCandidate(_normalizeAttachmentPath(payload.resolvedPath, decode: false));
+    addCandidate(_normalizeAttachmentPath(payload.url));
+    addCandidate(_normalizeAttachmentPath(payload.url, decode: false));
+    addCandidate(
+        _normalizeAttachmentPath(_extractAttachmentPathFromUrl(payload.url)));
+    addCandidate(
+      _normalizeAttachmentPath(
+        _extractAttachmentPathFromUrl(payload.url, decode: false),
+        decode: false,
+      ),
+    );
+
+    return candidates;
+  }
+
+  String? _normalizeSignedUrl(String? rawUrl) {
+    final value = (rawUrl ?? '').trim();
+    if (value.isEmpty) return null;
+
+    final parsed = Uri.tryParse(value);
+    if (parsed != null && parsed.hasScheme) {
+      return parsed.toString();
+    }
+
+    final storageBase = supabase.storage.url.replaceAll(RegExp(r'/$'), '');
+    final projectBase = storageBase.replaceFirst(RegExp(r'/storage/v1$'), '');
+
+    if (value.startsWith('/storage/v1/')) {
+      return '$projectBase$value';
+    }
+
+    if (value.startsWith('/')) {
+      return '$storageBase$value';
+    }
+
+    if (value.startsWith('storage/v1/')) {
+      return '$projectBase/$value';
+    }
+
+    return '$storageBase/$value';
   }
 
   Future<String?> _createSignedAttachmentUrl(
     _MessagePayload payload, {
     int expiresInSeconds = 3600,
+    List<String>? pathCandidates,
   }) async {
-    final objectPath = payload.resolvedPath;
-    if (objectPath == null || objectPath.isEmpty) return null;
-    try {
-      return await supabase.storage
-          .from(_MessagePayload.attachmentBucket)
-          .createSignedUrl(objectPath, expiresInSeconds);
-    } catch (e) {
-      debugPrint('Signed URL create failed for $objectPath: $e');
-      return null;
+    final candidates =
+        pathCandidates ?? _buildAttachmentPathCandidates(payload);
+    if (candidates.isEmpty) return null;
+
+    var edgeSigningSupported = true;
+
+    for (final objectPath in candidates) {
+      if (edgeSigningSupported) {
+        try {
+          final viewerVaultId =
+              (_myVaultId ?? widget.activeVaultId ?? '').trim();
+          final response = await supabase.functions.invoke(
+            'get-signed-url',
+            body: {
+              'path': objectPath,
+              'conversation_id': widget.conversationId,
+              if (viewerVaultId.isNotEmpty) 'viewer_vault_id': viewerVaultId,
+              'expires_in': expiresInSeconds,
+            },
+          );
+          final data = response.data;
+          if (data is Map && data['signedUrl'] != null) {
+            final normalized =
+                _normalizeSignedUrl(data['signedUrl']?.toString());
+            if (normalized != null && normalized.isNotEmpty) return normalized;
+          }
+        } catch (e) {
+          final detail = e.toString();
+          if (detail.contains('UNAUTHORIZED_UNSUPPORTED_TOKEN_ALGORITHM')) {
+            edgeSigningSupported = false;
+          }
+          debugPrint('Edge signed URL failed for $objectPath: $e');
+        }
+      }
+
+      // Fallback: direct storage signed URL
+      try {
+        final signedUrl = await supabase.storage
+            .from(_MessagePayload.attachmentBucket)
+            .createSignedUrl(objectPath, expiresInSeconds);
+        final normalized = _normalizeSignedUrl(signedUrl);
+        if (normalized != null && normalized.isNotEmpty) return normalized;
+      } catch (e) {
+        debugPrint('Signed URL create failed for $objectPath: $e');
+      }
     }
+
+    return null;
   }
 
   Future<bool> _openImage(_MessagePayload payload) async {
     if (!mounted) return false;
-    final objectPath = payload.resolvedPath;
-    if (objectPath == null || objectPath.isEmpty) {
+    final pathCandidates = _buildAttachmentPathCandidates(payload);
+    if (pathCandidates.isEmpty) {
       _showSnack('Görsel yolu bulunamadı.');
       return false;
     }
 
     Uint8List? bytes;
-    try {
-      bytes = await supabase.storage
-          .from(_MessagePayload.attachmentBucket)
-          .download(objectPath);
-    } catch (e) {
-      debugPrint('Attachment download failed for $objectPath: $e');
+    for (final objectPath in pathCandidates) {
+      try {
+        bytes = await supabase.storage
+            .from(_MessagePayload.attachmentBucket)
+            .download(objectPath);
+        if (bytes.isNotEmpty) break;
+      } catch (e) {
+        debugPrint('Attachment download failed for $objectPath: $e');
+      }
     }
 
     if (bytes != null && mounted) {
@@ -1028,6 +1198,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     final signedUrl = await _createSignedAttachmentUrl(
       payload,
       expiresInSeconds: 900,
+      pathCandidates: pathCandidates,
     );
     if (!mounted || signedUrl == null) {
       _showSnack('Görsele erişilemedi.');
@@ -1074,7 +1245,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
         ),
       ),
     );
-    return false;
+    return true;
   }
 
   Future<void> _openFileInfo(_MessagePayload payload) async {
@@ -1247,6 +1418,7 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
                               onTap: () => _onMessageTap(
                                 messageId: messageId,
                                 payload: payload,
+                                isMe: isMe,
                               ),
                               child: _MessageBubble(
                                 payload: payload,

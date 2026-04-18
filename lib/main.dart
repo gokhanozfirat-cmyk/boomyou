@@ -5,6 +5,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'core/router.dart';
 import 'core/theme.dart';
 import 'services/auth_service.dart';
+import 'services/notification_service.dart';
 import 'services/vault_service.dart';
 
 Future<void> main() async {
@@ -32,13 +33,28 @@ Future<void> main() async {
   final authService = AuthService();
   try {
     await authService.ensureAnonymousAuth();
-  } catch (_) {}
+    debugPrint('Current auth user: ${authService.currentUserId}');
+  } catch (e, st) {
+    debugPrint('Anonymous auth failed: $e');
+    debugPrint('$st');
+  }
 
   // Initialize default vault for the user
   final vaultService = VaultService();
   try {
     await vaultService.initDefaultVault();
-  } catch (_) {}
+  } catch (e, st) {
+    debugPrint('Default vault init failed: $e');
+    debugPrint('$st');
+  }
+
+  // Initialize push notifications & FCM token sync
+  try {
+    await NotificationService().initialize();
+  } catch (e, st) {
+    debugPrint('NotificationService init failed: $e');
+    debugPrint('$st');
+  }
 
   runApp(const BoomYouApp());
 }
