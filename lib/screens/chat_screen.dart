@@ -500,6 +500,24 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
             }
           },
         )
+        .onPostgresChanges(
+          event: PostgresChangeEvent.delete,
+          schema: 'public',
+          table: 'messages',
+          callback: (payload) {
+            final messageId = (payload.oldRecord['id'] ?? '').toString().trim();
+            if (messageId.isEmpty || !mounted) return;
+            setState(() {
+              _messages.removeWhere(
+                (m) => (m['id'] ?? '').toString().trim() == messageId,
+              );
+              _hiddenMessageIds.remove(messageId);
+              _selectedMessageIds.remove(messageId);
+              _locallyConsumedOneTimeIds.remove(messageId);
+            });
+            unawaited(_persistLocallyConsumedOneTimeMessages());
+          },
+        )
         .subscribe();
   }
 

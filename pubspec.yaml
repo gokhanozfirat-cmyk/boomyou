@@ -1,7 +1,7 @@
 name: boomyou
 description: "Boomyou"
 publish_to: 'none'
-version: 1.1.5+16
+version: 1.1.5+18
 environment:
   sdk: ^3.5.0
 dependencies:
